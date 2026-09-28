@@ -1,0 +1,10 @@
+/*
+!/.gitignore
+!/AGENTS.md
+!/CodexLimitShow.csproj
+!/*.cs
+/Program.cs
+!/LICENSE
+!/README.md
+!/tools/
+!/启动 Codex 与用量组件.cmd
