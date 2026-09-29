@@ -8,11 +8,11 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CodexLimitShow</AssemblyName>
     <RootNamespace>CodexLimitShow</RootNamespace>
-    <Version>1.3.0</Version>
-    <InformationalVersion>1.3.0</InformationalVersion>
+    <Version>1.4.0</Version>
+    <InformationalVersion>1.4.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <AssemblyVersion>1.3.0.0</AssemblyVersion>
-    <FileVersion>1.3.0.0</FileVersion>
+    <AssemblyVersion>1.4.0.0</AssemblyVersion>
+    <FileVersion>1.4.0.0</FileVersion>
   </PropertyGroup>
   <ItemGroup>
     <Compile Remove="Program.cs" />

@@ -28,6 +28,8 @@ internal sealed class GlassWidget : Window
     private readonly WinForms.NotifyIcon _tray;
     private readonly HashSet<string> _subscriptionAttempted = [];
     private readonly HashSet<string> _expiryContradictionChecked = [];
+    private readonly HashSet<string> _busyActions = [];
+    private readonly Dictionary<string, (Button Control, string Label, string BusyLabel)> _actionButtons = [];
     private QuotaSnapshot? _snapshot;
     private HistoryGlass? _history;
     private Border? _panel;
@@ -77,7 +79,7 @@ internal sealed class GlassWidget : Window
             ContextMenuStrip = new WinForms.ContextMenuStrip()
         };
         _tray.ContextMenuStrip.Items.Add("显示", null, (_, _) => Dispatcher.Invoke(ShowFromTray));
-        _tray.ContextMenuStrip.Items.Add("打开 Codex", null, (_, _) => Dispatcher.Invoke(OpenCodex));
+        _tray.ContextMenuStrip.Items.Add("打开 Codex", null, (_, _) => Dispatcher.Invoke(() => _ = OpenCodexAsync()));
         _tray.ContextMenuStrip.Items.Add("刷新额度", null, (_, _) => Dispatcher.Invoke(() => _ = RefreshAsync(true)));
         _tray.ContextMenuStrip.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Exit));
         _tray.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
@@ -170,6 +172,7 @@ internal sealed class GlassWidget : Window
         {
             var next = await _client.ReadSnapshotAsync(CancellationToken.None, forceAccount);
             var oldAccount = _snapshot?.Account?.StorageKey;
+            if (oldAccount != next.Account?.StorageKey) _subscriptionError = null;
             var saved = next.Account is null ? null : _store.Load().FirstOrDefault(x => x.StorageKey == next.Account.StorageKey);
             if (next.Account is not null && saved?.SubscriptionExpiresAt is not null)
                 next = next with { Account = next.Account with { SubscriptionExpiresAt = saved.SubscriptionExpiresAt,
@@ -238,8 +241,8 @@ internal sealed class GlassWidget : Window
         }
         catch (Exception ex)
         {
-            _subscriptionError = ex is CodexClientException { Message: var message } && message.Contains("HTTP 403", StringComparison.Ordinal)
-                ? "官方订阅接口暂时拒绝访问（403），已保留上次记录"
+            _subscriptionError = ex is CodexClientException { Message: var message } && message.Contains("网页防护拦截", StringComparison.Ordinal)
+                ? "订阅网页防护拦截（403）；已保留上次核验值"
                 : SafeError(ex);
         }
         RebuildPanel();
@@ -380,11 +383,11 @@ internal sealed class GlassWidget : Window
         title.VerticalAlignment = VerticalAlignment.Center;
         title.Margin = new Thickness(6, 0, 0, 0);
         Grid.SetColumn(title, 1); top.Children.Add(title);
-        var openCodex = Button("打开 Codex", OpenCodex, 84);
+        var openCodex = BusyButton("open", "打开 Codex", "打开中…", OpenCodexAsync, 84);
         Grid.SetColumn(openCodex, 2); top.Children.Add(openCodex);
         if (formal)
         {
-            var upgrade = Button("升级", () => _ = UpgradeAsync(), 52);
+            var upgrade = BusyButton("upgrade", "升级", "检查中…", UpgradeAsync, 52);
             Grid.SetColumn(upgrade, 3); top.Children.Add(upgrade);
         }
         var pin = Button(_pinned ? "● 固定" : "◇ 固定", () => { _pinned = !_pinned; RebuildPanel(); }, 66);
@@ -401,10 +404,11 @@ internal sealed class GlassWidget : Window
         };
         body.Children.Add(top);
         body.Children.Add(AccountCard(s));
-        var verify = Button("手动刷新有效期 ↗", () =>
+        var verify = BusyButton("subscription", "手动刷新有效期 ↗", "核验中…", () =>
         {
-            if (_snapshot?.Account is { } a) _ = VerifySubscriptionAsync(a.StorageKey);
+            return _snapshot?.Account is { } a ? VerifySubscriptionAsync(a.StorageKey) : Task.CompletedTask;
         }, 150);
+        if (_snapshot?.Account is null) verify.IsEnabled = false;
         verify.HorizontalAlignment = HA.Left;
         verify.Margin = new Thickness(0, 7, 0, 13);
         body.Children.Add(verify);
@@ -434,7 +438,7 @@ internal sealed class GlassWidget : Window
         body.Children.Add(_status);
         var actions = new UniformGrid { Columns = 4, Margin = new Thickness(0, 10, 0, 0) };
         actions.Children.Add(Button("历史", ToggleHistory));
-        actions.Children.Add(Button("使用重置", () => _ = UseResetAsync()));
+        actions.Children.Add(BusyButton("reset", "使用重置", "处理中…", UseResetAsync));
         actions.Children.Add(Button("托盘", () => { _history?.Hide(); Hide(); }));
         actions.Children.Add(Button("退出", Exit));
         actions.Margin = new Thickness(18, 8, 18, 16);
@@ -554,6 +558,49 @@ internal sealed class GlassWidget : Window
         return button;
     }
 
+    private Button BusyButton(string key, string label, string busyLabel, Func<Task> action, double minWidth = 0)
+    {
+        var button = Button(label, () => _ = RunBusyActionAsync(key, action), minWidth);
+        _actionButtons[key] = (button, label, busyLabel);
+        SetBusyVisual(button, label, busyLabel, _busyActions.Contains(key));
+        return button;
+    }
+
+    private async Task RunBusyActionAsync(string key, Func<Task> action)
+    {
+        if (!_busyActions.Add(key)) return;
+        UpdateBusyVisual(key);
+        try { await action(); }
+        catch (Exception ex)
+        {
+            if (_status is not null) _status.Text = $"操作失败：{SafeError(ex)}";
+        }
+        finally
+        {
+            _busyActions.Remove(key);
+            UpdateBusyVisual(key);
+        }
+    }
+
+    private void UpdateBusyVisual(string key)
+    {
+        if (_actionButtons.TryGetValue(key, out var item))
+            SetBusyVisual(item.Control, item.Label, item.BusyLabel, _busyActions.Contains(key));
+    }
+
+    private static void SetBusyVisual(Button button, string label, string busyLabel, bool busy)
+    {
+        button.IsEnabled = !busy;
+        button.Background = new SolidColorBrush(C(busy ? "#80616E87" : "#76485867"));
+        if (!busy) { button.Content = label; return; }
+        var content = new Grid { Width = Math.Max(button.MinWidth - 5, 40), Height = 22 };
+        content.Children.Add(new TextBlock { Text = busyLabel, FontSize = 11, Foreground = new SolidColorBrush(C("#E4F2EE")),
+            HorizontalAlignment = HA.Center, VerticalAlignment = VerticalAlignment.Center });
+        content.Children.Add(new System.Windows.Controls.ProgressBar { IsIndeterminate = true, Height = 2, VerticalAlignment = VerticalAlignment.Bottom,
+            Foreground = new SolidColorBrush(C("#70E9B0")), Background = Brushes.Transparent, IsHitTestVisible = false });
+        button.Content = content;
+    }
+
     private static T? FindAncestor<T>(DependencyObject? node) where T : DependencyObject
     {
         while (node is not null)
@@ -577,7 +624,15 @@ internal sealed class GlassWidget : Window
         content.SetValue(ContentPresenter.HorizontalAlignmentProperty, HA.Center);
         content.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
         border.AppendChild(content);
-        return new ControlTemplate(typeof(Button)) { VisualTree = border };
+        border.Name = "chrome";
+        var template = new ControlTemplate(typeof(Button)) { VisualTree = border };
+        var hover = new Trigger { Property = System.Windows.Controls.Button.IsMouseOverProperty, Value = true };
+        hover.Setters.Add(new Setter(Border.BorderBrushProperty, new SolidColorBrush(C("#B7B5C9D7")), "chrome"));
+        template.Triggers.Add(hover);
+        var pressed = new Trigger { Property = System.Windows.Controls.Button.IsPressedProperty, Value = true };
+        pressed.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush(C("#B2788B9E")), "chrome"));
+        template.Triggers.Add(pressed);
+        return template;
     }
 
     private async Task UseResetAsync()
@@ -702,19 +757,44 @@ internal sealed class GlassWidget : Window
         }
     }
 
-    private void OpenCodex()
+    private async Task OpenCodexAsync()
     {
         try
         {
             Process.Start(new ProcessStartInfo("explorer.exe", @"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App")
                 { UseShellExecute = true });
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(25);
+            while (!CodexDesktopHasWindow())
+            {
+                if (DateTimeOffset.UtcNow >= deadline) throw new TimeoutException();
+                await Task.Delay(250);
+            }
         }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or FileNotFoundException)
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or FileNotFoundException or TimeoutException)
         {
-            const string message = "无法打开 Codex，请确认已安装 Codex Desktop。";
+            var message = ex is TimeoutException ? "已请求打开 Codex，但 25 秒内未检测到窗口。" :
+                "无法打开 Codex，请确认已安装 Codex Desktop。";
             if (_status is not null) _status.Text = message;
             _tray.ShowBalloonTip(3000, "Codex 用量", message, WinForms.ToolTipIcon.Warning);
         }
+    }
+
+    private static bool CodexDesktopHasWindow()
+    {
+        foreach (var process in Process.GetProcessesByName("ChatGPT"))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (process.MainWindowHandle != IntPtr.Zero &&
+                        process.MainModule?.FileName.Contains(@"\OpenAI.Codex_", StringComparison.OrdinalIgnoreCase) == true)
+                        return true;
+                }
+                catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or UnauthorizedAccessException) { }
+            }
+        }
+        return false;
     }
     private void Exit() => Close();
 
@@ -762,6 +842,12 @@ internal sealed class GlassWidget : Window
         _expanded = true;
         RebuildPanel();
         Save((UIElement)Content, 400, 700, "preview-glass-panel.png");
+        _busyActions.Add("open");
+        _busyActions.Add("subscription");
+        _busyActions.Add("reset");
+        RebuildPanel();
+        Save((UIElement)Content, 400, 700, "preview-glass-panel-busy.png");
+        _busyActions.Clear();
         var confirm = new ConfirmGlass("sample@example.com", 1);
         Save((UIElement)confirm.Content, 420, 285, "preview-glass-confirm.png");
         var previewDirectory = Path.Combine(Path.GetTempPath(), $"CodexLimitShow-preview-{Guid.NewGuid():N}");

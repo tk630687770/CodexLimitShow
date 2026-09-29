@@ -29,7 +29,8 @@ internal sealed class SubscriptionLookup
             if (expiry is not null && expiry > DateTimeOffset.Now)
                 return expiry;
         }
-        catch (CodexClientException ex) when (!ex.Message.Contains("HTTP 401", StringComparison.Ordinal))
+        catch (CodexClientException ex) when (!ex.Message.Contains("HTTP 401", StringComparison.Ordinal) &&
+                                               !ex.Message.Contains("网页防护拦截", StringComparison.Ordinal))
         {
             // This private endpoint is not stable. Try the account-scoped subscription view once.
         }
@@ -57,10 +58,19 @@ internal sealed class SubscriptionLookup
             request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", accountId);
         using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
         if (!response.IsSuccessStatusCode)
-            throw new CodexClientException($"订阅查询失败：HTTP {(int)response.StatusCode}");
+        {
+            throw new CodexClientException(IsWebProtectionResponse(response)
+                ? "订阅查询被网页防护拦截（403）"
+                : $"订阅查询失败：HTTP {(int)response.StatusCode}");
+        }
         await using var stream = await response.Content.ReadAsStreamAsync(token);
         return await JsonDocument.ParseAsync(stream, cancellationToken: token);
     }
+
+    private static bool IsWebProtectionResponse(HttpResponseMessage response) =>
+        response.StatusCode == System.Net.HttpStatusCode.Forbidden &&
+        response.Content.Headers.ContentType?.MediaType == "text/html" &&
+        response.Headers.Server.Any(value => value.Product?.Name?.Equals("cloudflare", StringComparison.OrdinalIgnoreCase) == true);
 
     private static bool TokenEmailMatches(string? jwt, string expectedEmail)
     {
@@ -131,6 +141,10 @@ internal sealed class SubscriptionLookup
 
     internal static void SelfTest()
     {
+        using var blocked = new HttpResponseMessage(System.Net.HttpStatusCode.Forbidden)
+            { Content = new StringContent("blocked", System.Text.Encoding.UTF8, "text/html") };
+        blocked.Headers.Server.ParseAdd("cloudflare");
+        if (!IsWebProtectionResponse(blocked)) throw new InvalidOperationException("Cloudflare block classification failed.");
         using var sample = JsonDocument.Parse("""
             {"accounts":[{"account":{"id":"other"},"entitlement":{"expires_at":"2026-10-01T00:00:00Z"}},
             {"account":{"id":"wanted"},"entitlement":{"expires_at":"2026-11-01T00:00:00Z"}}]}
