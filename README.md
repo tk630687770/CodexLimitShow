@@ -10,7 +10,7 @@ Windows 10/11 桌面悬浮组件：本机单进程 WPF 界面，通过 Codex CLI
 - 详情标题栏或托盘菜单可打开 Codex Desktop；详情内还可固定位置、打开只读历史、缩至托盘、退出。打开 Codex、升级、有效期核验和使用重置在操作返回前显示进度反馈；打开 Codex 会等到检测到桌面窗口或超时。额度每 30 秒读取一次；账号资料仅首次、登录文件变化及强制核对时读取；token 活动统计仅启动或跨日读取。
 - 订阅日期优先显示当前账号登录凭据中自带的订阅截止声明，并标为“本地记录·待核验”；它不是令牌自身的过期时间，也不等于刚刚联网核验成功。仅首次识别／账号变化、用户点“手动刷新有效期”、已存日期与当前套餐矛盾时尝试联网核验。非公开 ChatGPT 接口可能被 Cloudflare 网页防护以 HTML 403 拦截，此时保留本地日期或上次核验值并显示原因，不读取浏览器 Cookie 绕过防护。
 - “使用重置”要求当前账号、新鲜额度、可用机会和用户二次确认。调用官方 App Server `account/rateLimitResetCredit/consume`，只传一次性幂等键，不传 credit ID。结果不确定时本次运行不再发起新的消费。**构建和验证期间没有实际消费机会。**
-- 只有从 `正式版/` 启动且正式版标记与程序版本一致时，详情顶部才显示“升级”。点击后比较本地 `release/versions/` 与公开 GitHub 最新正式 Release；用户确认后才下载、校验 SHA-256、替换并重启。日常额度刷新不会检查或下载更新。
+- 详情顶部始终显示“升级”；点击后才检查公开 GitHub 最新正式 Release。用户确认后下载单文件 EXE、校验 SHA-256 和版本，旧进程退出后原位替换并重启。日常额度刷新不会检查或下载更新；程序所在目录需允许当前用户写入。
 
 ## 隐私与限制
 
@@ -32,15 +32,15 @@ dotnet run -- --render-preview
 
 `--probe` 仅输出配额百分比和机会数量；`--probe-subscription` 仅输出本地时间日期或安全错误类型；`--render-preview` 生成玻璃双圈、停靠玻璃条、面板预览 PNG。它们均不消费重置机会。
 
-发布自包含单文件（项目根目录执行；首次建立正式版才加 `-InstallFormal`）：
+生成自包含单文件发布候选（项目根目录执行）：
 
 ```powershell
-.\tools\Publish-CodexLimitShow.ps1 -InstallFormal
+.\tools\Publish-CodexLimitShow.ps1
 ```
 
-后续先递增 `.csproj` 版本号，再运行同一脚本（不带 `-InstallFormal`）；它写入 `release/versions/` 和 `release/packages/`，正式版用户再点“升级”。版本目录名、程序版本及校验清单必须一致；旧版本不覆盖，供回退。既有 `dist/` 仅作为历史包保留，不参与升级。目标电脑不必单独安装 .NET，但需安装并登录 Codex Desktop。
+先递增 `.csproj` 中的版本号，再运行脚本。它会构建、自测并生成 `release/CodexLimitShow.exe`，只用于上传对应版本的 GitHub 正式 Release，不自动安装或上传。GitHub Release 标签、程序版本和 SHA-256 必须匹配。既有 `release/versions/`、`release/packages/`、`正式版/`、`dist/` 仅作为历史内容保留，不参与新版升级。目标电脑不必单独安装 .NET，但需安装并登录 Codex Desktop。
 
-其他电脑首次安装：从 [GitHub Releases](https://github.com/tk630687770/CodexLimitShow/releases) 下载最新 `CodexLimitShow-<版本>-win-x64.zip`，解压后把内层 `CodexLimitShow-<版本>-win-x64` 文件夹改名为 `正式版`，运行其中的 `CodexLimitShow.exe`。以后点击面板中的“升级”即可远程更新；账户快照保存在本机，不随升级包传输。公开发布不要求其他电脑登录 GitHub。
+其他电脑首次安装：从 [GitHub Releases](https://github.com/tk630687770/CodexLimitShow/releases) 下载最新正式版 `CodexLimitShow.exe`，放进当前用户有写权限的目录并运行；以后点击面板中的“升级”即可远程更新。1.x ZIP 版本需手动下载 2.x EXE 一次，旧升级器不能识别新的单文件发布格式。账户快照保存在本机，不随升级包传输；公开发布不要求其他电脑登录 GitHub。
 
 ## 源码与许可证
 
@@ -48,6 +48,7 @@ dotnet run -- --render-preview
 - `CodexAppServerClient.cs`：本地 App Server 客户端、数据筛选解析及重置调用
 - `SubscriptionLookup.cs`：隔离的非公开订阅日期只读查询
 - `SnapshotStore.cs`：各账号最后一次成功快照
+- `ReleaseUpdater.cs`：GitHub 正式版检查、下载校验和原位更新
 - 旧 WinForms 实现仅在本机备份中保留，不参与编译或公开仓库
 
 项目代码继续采用 MIT。未复制 Cockpit Tools 或其他第三方项目源码与素材；仅参考公开的接口调用思路。Cockpit Tools 的 CC BY-NC-SA 许可不会因本项目的独立实现而进入此代码库。

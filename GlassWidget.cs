@@ -19,7 +19,7 @@ internal sealed class GlassWidget : Window
     private readonly CodexAppServerClient _client = new();
     private readonly SnapshotStore _store = new();
     private readonly SubscriptionLookup _subscriptions = new();
-    private readonly LocalRelease _localRelease = new();
+    private readonly ReleaseUpdater _releaseUpdater = new();
     private readonly DualRing _ring = new();
     private readonly DispatcherTimer _refreshTimer = new() { Interval = TimeSpan.FromSeconds(30) };
     private readonly DispatcherTimer _glintTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
@@ -383,11 +383,10 @@ internal sealed class GlassWidget : Window
         var s = _snapshot;
         var body = new StackPanel { Margin = new Thickness(20, 15, 20, 16) };
         var top = new Grid();
-        var formal = _localRelease.IsFormal(Environment.ProcessPath);
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition());
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        if (formal) top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var collapse = Button("‹", ToggleExpanded, 26);
         collapse.Width = 26;
@@ -399,13 +398,10 @@ internal sealed class GlassWidget : Window
         Grid.SetColumn(title, 1); top.Children.Add(title);
         var openCodex = BusyButton("open", "打开 Codex", "打开中…", OpenCodexAsync, 84);
         Grid.SetColumn(openCodex, 2); top.Children.Add(openCodex);
-        if (formal)
-        {
-            var upgrade = BusyButton("upgrade", "升级", "检查中…", UpgradeAsync, 52);
-            Grid.SetColumn(upgrade, 3); top.Children.Add(upgrade);
-        }
+        var upgrade = BusyButton("upgrade", "升级", "检查中…", UpgradeAsync, 52);
+        Grid.SetColumn(upgrade, 3); top.Children.Add(upgrade);
         var pin = Button(_pinned ? "● 固定" : "◇ 固定", () => { _pinned = !_pinned; RebuildPanel(); }, 66);
-        Grid.SetColumn(pin, formal ? 4 : 3); top.Children.Add(pin);
+        Grid.SetColumn(pin, 4); top.Children.Add(pin);
         top.Cursor = Cursors.SizeAll;
         top.MouseLeftButtonDown += (_, e) =>
         {
@@ -449,8 +445,7 @@ internal sealed class GlassWidget : Window
             $"更新于 {s?.FetchedAt:HH:mm:ss} · 每 30 秒刷新额度", 10,
             _ring.IsStale ? C("#E7B47E") : C("#8EA2AC"), FontWeights.Normal, 13));
         var version = typeof(GlassWidget).Assembly.GetName().Version?.ToString(3) ?? "未知";
-        body.Children.Add(Text($"v{version} · {(formal ? "正式版" : "非正式目录，升级按钮不可用")}",
-            10, C("#8EA2AC"), FontWeights.Normal, 4));
+        body.Children.Add(Text($"v{version} · 单文件版", 10, C("#8EA2AC"), FontWeights.Normal, 4));
         _status = Text("", 10, C("#E7B47E"), FontWeights.Normal);
         body.Children.Add(_status);
         var actions = new UniformGrid { Columns = 4, Margin = new Thickness(0, 10, 0, 0) };
@@ -718,47 +713,41 @@ internal sealed class GlassWidget : Window
     private void ShowFromTray() { Show(); Activate(); }
     private async Task UpgradeAsync()
     {
-        if (_upgradeBusy || !_localRelease.IsFormal(Environment.ProcessPath)) return;
+        if (_upgradeBusy) return;
         _upgradeBusy = true;
         try
         {
-            if (_status is not null) _status.Text = "正在检查本地和 GitHub 正式版…";
-            var (current, candidate) = await Task.Run(() => _localRelease.Check(Environment.ProcessPath!));
+            var current = _releaseUpdater.CurrentVersion(Environment.ProcessPath) ??
+                throw new InvalidOperationException("无法读取当前程序版本。");
+            if (_status is not null) _status.Text = "正在检查 GitHub 正式版…";
             RemoteReleaseCandidate? remote = null;
             Exception? remoteError = null;
             try
             {
                 using var checkTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                remote = await _localRelease.CheckRemoteAsync(checkTimeout.Token);
+                remote = await _releaseUpdater.CheckRemoteAsync(checkTimeout.Token);
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
             { remoteError = ex; }
-            var downloadRemote = remote is not null && remote.Version > current &&
-                (candidate is null || remote.Version > candidate.Version);
-            if (candidate is null && !downloadRemote)
+            if (remote is null || remote.Version <= current)
             {
                 System.Windows.MessageBox.Show(this, remoteError is null
-                    ? $"当前版本 {current}，没有更高的正式版。"
-                    : $"GitHub 检查失败（{SafeError(remoteError)}），本地也没有更高版本。", "检查升级",
+                    ? $"当前版本 {current}，GitHub 没有更高的单文件正式版。"
+                    : $"GitHub 检查失败：{SafeError(remoteError)}", "检查升级",
                     MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
-            var nextVersion = downloadRemote ? remote!.Version : candidate!.Version;
             if (System.Windows.MessageBox.Show(this,
-                    $"从 {current} 升级到 {nextVersion}？\n来源：{(downloadRemote ? "GitHub 正式发布包（确认后才下载）" : "本地发布目录")}。\n程序会退出、替换正式版并重新打开。历史账号快照不会删除。",
-                    "升级正式版", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
-            var formal = Path.GetDirectoryName(Environment.ProcessPath!)!;
-            if (downloadRemote)
-            {
-                if (_status is not null) _status.Text = "正在下载并校验 GitHub 正式版…";
-                candidate = await _localRelease.DownloadAsync(remote!, formal, CancellationToken.None);
-            }
-            if (candidate is null) throw new InvalidOperationException("没有可用的升级版本。");
-            var start = new ProcessStartInfo(candidate.Executable) { UseShellExecute = false, WorkingDirectory = candidate.Directory };
-            start.ArgumentList.Add("--apply-local-update");
-            start.ArgumentList.Add(candidate.Directory);
-            start.ArgumentList.Add(formal);
+                    $"从 {current} 升级到 {remote.Version}？\n确认后从 GitHub 下载并校验程序，退出旧版后原位替换。历史账号快照不会删除。",
+                    "升级程序", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+            if (_status is not null) _status.Text = "正在下载并校验 GitHub 正式版…";
+            var downloaded = await _releaseUpdater.DownloadAsync(remote, CancellationToken.None);
+            var start = new ProcessStartInfo(downloaded) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(downloaded)! };
+            start.ArgumentList.Add("--apply-update");
+            start.ArgumentList.Add(downloaded);
+            start.ArgumentList.Add(Environment.ProcessPath!);
             start.ArgumentList.Add(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            start.ArgumentList.Add(remote.Sha256);
             using var helper = Process.Start(start) ?? throw new InvalidOperationException("升级辅助程序无法启动。");
             Close();
         }

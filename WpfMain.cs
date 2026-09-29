@@ -8,21 +8,21 @@ internal static class WpfMain
     [STAThread]
     private static void Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "--apply-local-update")
+        if (args.Length > 0 && args[0] == "--apply-update")
         {
             try
             {
-                if (args.Length != 4 || !int.TryParse(args[3], out var oldProcessId) ||
+                if (args.Length != 5 || !int.TryParse(args[3], out var oldProcessId) ||
                     !Path.GetFullPath(Environment.ProcessPath ?? string.Empty).Equals(
-                        Path.Combine(Path.GetFullPath(args[1]), LocalRelease.ExecutableName), StringComparison.OrdinalIgnoreCase))
+                        Path.GetFullPath(args[1]), StringComparison.OrdinalIgnoreCase))
                     throw new ArgumentException("升级参数无效。");
-                new LocalRelease().Apply(args[1], args[2], oldProcessId);
-                Process.Start(new ProcessStartInfo(Path.Combine(args[2], LocalRelease.ExecutableName))
-                    { UseShellExecute = true, WorkingDirectory = args[2] });
+                new ReleaseUpdater().Apply(args[1], args[2], oldProcessId, args[4]);
+                Process.Start(new ProcessStartInfo(args[2])
+                    { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(args[2]))! });
             }
             catch (Exception ex)
             {
-                System.Windows.MessageBox.Show($"升级失败；原版本仍可从 release/versions 启动或恢复。\n{ex.Message}",
+                System.Windows.MessageBox.Show($"升级失败；如果程序已替换，可从 GitHub 历史 Release 取回旧版。\n{ex.Message}",
                     "CodexLimitShow", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             return;
@@ -34,7 +34,7 @@ internal static class WpfMain
             SnapshotStore.SelfTest();
             RingGeometry.SelfTest();
             SubscriptionLookup.SelfTest();
-            LocalRelease.SelfTest();
+            ReleaseUpdater.SelfTest();
             var resetJson = System.Text.Json.JsonSerializer.Serialize(new ResetConsumeParameters("test-key"));
             if (!resetJson.Contains("idempotencyKey") || resetJson.Contains("creditId"))
                 throw new InvalidOperationException("Reset request must contain only the idempotency key.");
@@ -72,6 +72,7 @@ internal static class WpfMain
             widget.Close();
             return;
         }
+        ReleaseUpdater.CleanupOldDownloads();
         var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
         app.Run(new GlassWidget());
     }
