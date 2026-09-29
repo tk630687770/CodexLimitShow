@@ -468,8 +468,16 @@ internal sealed class GlassWidget : Window
             Background = new LinearGradientBrush(C("#EA303545"), C("#F3182029"), 112),
             Child = layout
         };
-        Content = new Border { Padding = new Thickness(3), Background = Brushes.Transparent,
+        var shell = new Border { Padding = new Thickness(3), Background = Brushes.Transparent,
             Child = _panel };
+        Content = shell;
+        body.Measure(new System.Windows.Size(Width - 8, double.PositiveInfinity));
+        actions.Measure(new System.Windows.Size(Width - 8, double.PositiveInfinity));
+        var dpi = VisualTreeHelper.GetDpi(this).DpiScaleY;
+        var area = WinForms.Screen.FromHandle(new Interop.WindowInteropHelper(this).Handle).WorkingArea;
+        Height = Math.Min(Math.Ceiling(body.DesiredSize.Height + actions.DesiredSize.Height + 8), area.Height / dpi - 16);
+        Top = Math.Clamp(Top, area.Top / dpi + 8, area.Bottom / dpi - Height - 8);
+        if (_history?.IsVisible == true) PositionHistory();
     }
 
     private Border QuotaCard(string label, RateWindow? value)
@@ -827,8 +835,9 @@ internal sealed class GlassWidget : Window
     {
         _snapshot = new QuotaSnapshot(
             new RateWindow(300, 38, DateTimeOffset.Now.AddHours(2)),
-            new RateWindow(10080, 54, DateTimeOffset.Now.AddDays(3)), [], 1,
-            [new ResetCredit("Full reset", "available", DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddDays(12))],
+            new RateWindow(10080, 54, DateTimeOffset.Now.AddDays(3)), [], 2,
+            [new ResetCredit("Full reset", "available", DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddDays(12)),
+             new ResetCredit("Full reset", "available", DateTimeOffset.Now.AddDays(-2), DateTimeOffset.Now.AddDays(14))],
             new UsageStats(null, 2_650_000_000), DateTimeOffset.Now,
             new AccountSummary("PREVIEW", "sample@example.com", "plus", DateTimeOffset.Now.AddMonths(1)), "plus");
         _ring.Snapshot = _snapshot;
@@ -846,13 +855,15 @@ internal sealed class GlassWidget : Window
         Save(_ring, RingGeometry.DockWidth, RingGeometry.DockHeight, "preview-glass-bar-bottom.png");
         _ring.Edge = DockEdge.None;
         _expanded = true;
+        Width = 400; Height = 700;
+        _subscriptionError = "联网核验被拦截（403）；显示本地登录记录";
         RebuildPanel();
-        Save((UIElement)Content, 400, 700, "preview-glass-panel.png");
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel.png");
         _busyActions.Add("open");
         _busyActions.Add("subscription");
         _busyActions.Add("reset");
         RebuildPanel();
-        Save((UIElement)Content, 400, 700, "preview-glass-panel-busy.png");
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-busy.png");
         _busyActions.Clear();
         var confirm = new ConfirmGlass("sample@example.com", 1);
         Save((UIElement)confirm.Content, 420, 285, "preview-glass-confirm.png");
