@@ -40,6 +40,9 @@ internal sealed class GlassWidget : Window
     private bool _resetUncertain;
     private bool _dragging;
     private bool _upgradeBusy;
+    private bool _upgradeDownloading;
+    private string _upgradeBusyLabel = "检查中…";
+    private int? _upgradeProgress;
     private DockEdge _edge;
     private DockEdge _previewEdge;
     private System.Windows.Point _dragCursor;
@@ -582,7 +585,8 @@ internal sealed class GlassWidget : Window
     {
         var button = Button(label, () => _ = RunBusyActionAsync(key, action), minWidth);
         _actionButtons[key] = (button, label, busyLabel);
-        SetBusyVisual(button, label, busyLabel, _busyActions.Contains(key));
+        SetBusyVisual(button, label, key == "upgrade" ? _upgradeBusyLabel : busyLabel,
+            _busyActions.Contains(key), key == "upgrade" ? _upgradeProgress : null);
         return button;
     }
 
@@ -605,10 +609,18 @@ internal sealed class GlassWidget : Window
     private void UpdateBusyVisual(string key)
     {
         if (_actionButtons.TryGetValue(key, out var item))
-            SetBusyVisual(item.Control, item.Label, item.BusyLabel, _busyActions.Contains(key));
+            SetBusyVisual(item.Control, item.Label, key == "upgrade" ? _upgradeBusyLabel : item.BusyLabel,
+                _busyActions.Contains(key), key == "upgrade" ? _upgradeProgress : null);
     }
 
-    private static void SetBusyVisual(Button button, string label, string busyLabel, bool busy)
+    private void SetUpgradeVisual(string label, int? progress)
+    {
+        _upgradeBusyLabel = label;
+        _upgradeProgress = progress;
+        UpdateBusyVisual("upgrade");
+    }
+
+    private static void SetBusyVisual(Button button, string label, string busyLabel, bool busy, int? progress = null)
     {
         button.IsEnabled = !busy;
         button.Background = new SolidColorBrush(C(busy ? "#80616E87" : "#76485867"));
@@ -616,7 +628,8 @@ internal sealed class GlassWidget : Window
         var content = new Grid { Width = Math.Max(button.MinWidth - 5, 40), Height = 22 };
         content.Children.Add(new TextBlock { Text = busyLabel, FontSize = 11, Foreground = new SolidColorBrush(C("#E4F2EE")),
             HorizontalAlignment = HA.Center, VerticalAlignment = VerticalAlignment.Center });
-        content.Children.Add(new System.Windows.Controls.ProgressBar { IsIndeterminate = true, Height = 2, VerticalAlignment = VerticalAlignment.Bottom,
+        content.Children.Add(new System.Windows.Controls.ProgressBar { IsIndeterminate = progress is null, Value = progress ?? 0,
+            Minimum = 0, Maximum = 100, Height = 2, VerticalAlignment = VerticalAlignment.Bottom,
             Foreground = new SolidColorBrush(C("#70E9B0")), Background = Brushes.Transparent, IsHitTestVisible = false });
         button.Content = content;
     }
@@ -748,8 +761,30 @@ internal sealed class GlassWidget : Window
             if (System.Windows.MessageBox.Show(this,
                     $"从 {current} 升级到 {remote.Version}？\n确认后从 GitHub 下载并校验程序，退出旧版后原位替换。历史账号快照不会删除。",
                     "升级程序", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
-            if (_status is not null) _status.Text = "正在下载并校验 GitHub 正式版…";
-            var downloaded = await _releaseUpdater.DownloadAsync(remote, CancellationToken.None);
+            _upgradeDownloading = true;
+            SetUpgradeVisual("下载中", 0);
+            if (_status is not null) _status.Text = "正在下载 GitHub 正式版…";
+            var progress = new Progress<DownloadProgress>(value =>
+            {
+                if (!_upgradeBusy || !_upgradeDownloading) return;
+                if (value.Verifying)
+                {
+                    SetUpgradeVisual("校验中", null);
+                    if (_status is not null) _status.Text = "正在校验下载文件…";
+                }
+                else
+                {
+                    SetUpgradeVisual("下载中", value.Percent);
+                    if (_status is not null)
+                        _status.Text = value.Total is > 0
+                            ? $"下载中 {value.Percent}% · {value.Received / 1_048_576} / {value.Total.Value / 1_048_576} MB"
+                            : $"下载中 · 已接收 {value.Received / 1_048_576} MB";
+                }
+            });
+            var downloaded = await _releaseUpdater.DownloadAsync(remote, progress, CancellationToken.None);
+            _upgradeDownloading = false;
+            SetUpgradeVisual("安装中", null);
+            if (_status is not null) _status.Text = "正在安装新版…";
             var start = new ProcessStartInfo(downloaded) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(downloaded)! };
             start.ArgumentList.Add("--apply-update");
             start.ArgumentList.Add(downloaded);
@@ -766,7 +801,10 @@ internal sealed class GlassWidget : Window
         }
         finally
         {
+            _upgradeDownloading = false;
             _upgradeBusy = false;
+            _upgradeBusyLabel = "检查中…";
+            _upgradeProgress = null;
             if (_status is not null && IsLoaded) _status.Text = "";
         }
     }
@@ -865,6 +903,13 @@ internal sealed class GlassWidget : Window
         RebuildPanel();
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-busy.png");
         _busyActions.Clear();
+        _busyActions.Add("upgrade");
+        SetUpgradeVisual("下载中", 42);
+        RebuildPanel();
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-downloading.png");
+        _busyActions.Clear();
+        _upgradeBusyLabel = "检查中…";
+        _upgradeProgress = null;
         var confirm = new ConfirmGlass("sample@example.com", 1);
         Save((UIElement)confirm.Content, 420, 285, "preview-glass-confirm.png");
         var previewDirectory = Path.Combine(Path.GetTempPath(), $"CodexLimitShow-preview-{Guid.NewGuid():N}");

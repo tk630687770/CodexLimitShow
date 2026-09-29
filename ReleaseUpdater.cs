@@ -5,6 +5,10 @@ using System.Text.Json;
 namespace CodexLimitShow;
 
 internal sealed record RemoteReleaseCandidate(Version Version, string DownloadUrl, string Sha256);
+internal readonly record struct DownloadProgress(long Received, long? Total, bool Verifying)
+{
+    public int? Percent => Total is > 0 ? (int)Math.Clamp(Received * 100 / Total.Value, 0, 100) : null;
+}
 
 internal sealed class ReleaseUpdater
 {
@@ -50,28 +54,45 @@ internal sealed class ReleaseUpdater
         return null;
     }
 
-    public async Task<string> DownloadAsync(RemoteReleaseCandidate remote, CancellationToken cancellationToken)
+    public async Task<string> DownloadAsync(RemoteReleaseCandidate remote, IProgress<DownloadProgress>? progress,
+        CancellationToken cancellationToken)
     {
         var directory = UpdateDirectory();
         Directory.CreateDirectory(directory);
         var destination = Path.Combine(directory, $"CodexLimitShow-update-{Guid.NewGuid():N}.exe");
         try
         {
-            using var response = await Github.GetAsync(remote.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            using var response = await Github.GetAsync(remote.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
-            await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
+            var expectedBytes = response.Content.Headers.ContentLength;
+            if (expectedBytes > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
+            if (expectedBytes is <= 0) expectedBytes = null;
+            progress?.Report(new DownloadProgress(0, expectedBytes, false));
+            long total = 0;
+            await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
             await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 var buffer = new byte[81920];
-                long total = 0;
+                long lastReportedBytes = 0;
+                var lastPercent = 0;
                 int read;
-                while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
+                while ((read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
                 {
                     total += read;
                     if (total > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
-                    await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                    var current = new DownloadProgress(total, expectedBytes, false);
+                    if ((current.Percent is { } percent && percent > lastPercent) ||
+                        (expectedBytes is null && total - lastReportedBytes >= 1_048_576))
+                    {
+                        progress?.Report(current);
+                        lastPercent = current.Percent ?? lastPercent;
+                        lastReportedBytes = total;
+                    }
                 }
             }
+            progress?.Report(new DownloadProgress(total, expectedBytes, true));
             if (!HashMatches(destination, remote.Sha256) || _readVersion(destination) != remote.Version)
                 throw new InvalidDataException("GitHub 发布程序校验失败。");
             return destination;
@@ -181,6 +202,10 @@ internal sealed class ReleaseUpdater
         using var document = JsonDocument.Parse(releaseJson);
         if (ParseRemoteRelease(document.RootElement)?.Version != new Version(2, 0, 0))
             throw new Exception("GitHub single-file release parsing failed.");
+        if (new DownloadProgress(50, 100, false).Percent != 50 ||
+            new DownloadProgress(150, 100, false).Percent != 100 ||
+            new DownloadProgress(50, null, false).Percent is not null)
+            throw new Exception("Download progress calculation failed.");
         var root = Path.Combine(Path.GetTempPath(), $"CodexLimitShow-update-test-{Guid.NewGuid():N}");
         try
         {
