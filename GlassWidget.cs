@@ -448,6 +448,9 @@ internal sealed class GlassWidget : Window
         body.Children.Add(Text(_ring.IsStale ? "数据已过期 · 保留上次成功结果" :
             $"更新于 {s?.FetchedAt:HH:mm:ss} · 每 30 秒刷新额度", 10,
             _ring.IsStale ? C("#E7B47E") : C("#8EA2AC"), FontWeights.Normal, 13));
+        var version = typeof(GlassWidget).Assembly.GetName().Version?.ToString(3) ?? "未知";
+        body.Children.Add(Text($"v{version} · {(formal ? "正式版" : "非正式目录，升级按钮不可用")}",
+            10, C("#8EA2AC"), FontWeights.Normal, 4));
         _status = Text("", 10, C("#E7B47E"), FontWeights.Normal);
         body.Children.Add(_status);
         var actions = new UniformGrid { Columns = 4, Margin = new Thickness(0, 10, 0, 0) };
