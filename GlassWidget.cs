@@ -225,6 +225,18 @@ internal sealed class GlassWidget : Window
         if (_snapshot?.Account is not { } account || account.StorageKey != expectedKey) return;
         try
         {
+            var localExpiry = _subscriptions.ReadLocalExpiry(account);
+            if (localExpiry is { } local && _snapshot?.Account is { } current &&
+                current.StorageKey == expectedKey &&
+                (current.SubscriptionExpiresAt is null ||
+                 (current.SubscriptionCheckedAt is null && current.SubscriptionExpiresAt != local) ||
+                 (current.SubscriptionExpiresAt < DateTimeOffset.Now && local > current.SubscriptionExpiresAt)))
+            {
+                _snapshot = _snapshot with { Account = current with
+                    { SubscriptionExpiresAt = local, SubscriptionCheckedAt = null } };
+                _store.Save(_snapshot);
+                RebuildPanel();
+            }
             var expiry = await _subscriptions.ReadExpiryAsync(account, CancellationToken.None);
             if (_snapshot?.Account?.StorageKey != expectedKey) return;
             if (expiry is null)
@@ -242,7 +254,9 @@ internal sealed class GlassWidget : Window
         catch (Exception ex)
         {
             _subscriptionError = ex is CodexClientException { Message: var message } && message.Contains("网页防护拦截", StringComparison.Ordinal)
-                ? "订阅网页防护拦截（403）；已保留上次核验值"
+                ? _snapshot?.Account?.SubscriptionExpiresAt is null ? "订阅网页防护拦截（403）；暂无可显示日期"
+                    : _snapshot.Account.SubscriptionCheckedAt is null ? "联网核验被拦截（403）；显示本地登录记录"
+                    : "订阅网页防护拦截（403）；已保留上次核验值"
                 : SafeError(ex);
         }
         RebuildPanel();
@@ -799,7 +813,7 @@ internal sealed class GlassWidget : Window
     private void Exit() => Close();
 
     private static string ExpiryText(QuotaSnapshot? s) => s?.Account?.SubscriptionExpiresAt is { } date
-        ? $"{date:yyyy-MM-dd HH:mm}  {(date < DateTimeOffset.Now ? "待核验" : s.Account.SubscriptionCheckedAt is { } checkedAt ? $"核验 {checkedAt:MM-dd}" : "历史记录")}" : "未核验";
+        ? $"{date:yyyy-MM-dd HH:mm}  {(date < DateTimeOffset.Now ? "待核验" : s.Account.SubscriptionCheckedAt is { } checkedAt ? $"核验 {checkedAt:MM-dd}" : "本地记录·待核验")}" : "未核验";
     private static string PlanText(QuotaSnapshot? s) => (s?.RateLimitPlanType ?? s?.Account?.PlanType ?? "未知套餐").ToUpperInvariant();
     private static string ResetText(DateTimeOffset? date)
     {
@@ -1049,7 +1063,8 @@ internal sealed class HistoryGlass : Window
         Grid.SetColumn(plan, 1); accountRow.Children.Add(plan); stack.Children.Add(accountRow);
 
         stack.Children.Add(InfoCard("订阅有效期", x.SubscriptionExpiresAt?.ToString("yyyy-MM-dd HH:mm") ?? "未核验",
-            x.SubscriptionCheckedAt is null ? "没有成功核验记录" : $"最后核验 {x.SubscriptionCheckedAt:yyyy-MM-dd HH:mm}"));
+            x.SubscriptionCheckedAt is null ? x.SubscriptionExpiresAt is null ? "没有日期记录" : "本地登录记录，未联网核验"
+                : $"最后核验 {x.SubscriptionCheckedAt:yyyy-MM-dd HH:mm}"));
         stack.Children.Add(QuotaSnapshotCard("5 小时额度", x.FiveHour));
         var longWindow = x.Weekly ?? x.OtherWindows.FirstOrDefault(w => w.DurationMinutes is >= 40_320 and <= 44_640);
         stack.Children.Add(QuotaSnapshotCard(x.Weekly is null && longWindow is not null ? "月额度" : "7 天额度", longWindow));

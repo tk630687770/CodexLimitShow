@@ -1,4 +1,6 @@
 using System.Net.Http.Headers;
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
 
 namespace CodexLimitShow;
@@ -9,6 +11,20 @@ internal sealed class SubscriptionLookup
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
 
+    public DateTimeOffset? ReadLocalExpiry(AccountSummary expected)
+    {
+        var authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
+        using var auth = JsonDocument.Parse(File.ReadAllText(authPath));
+        var tokens = auth.RootElement.GetProperty("tokens");
+        var accountId = tokens.GetProperty("account_id").GetString();
+        var idToken = tokens.GetProperty("id_token").GetString();
+        if (string.IsNullOrWhiteSpace(accountId) ||
+            !TryReadTokenClaims(idToken, accountId, expected.Label, out var expiry))
+            throw new CodexClientException("订阅查询：本地登录账号无法确认一致");
+        // This is a saved login claim, not a fresh subscription verification.
+        return expiry;
+    }
+
     public async Task<DateTimeOffset?> ReadExpiryAsync(AccountSummary expected, CancellationToken token)
     {
         var authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
@@ -18,7 +34,7 @@ internal sealed class SubscriptionLookup
         var accountId = tokens.GetProperty("account_id").GetString();
         var idToken = tokens.GetProperty("id_token").GetString();
         if (string.IsNullOrWhiteSpace(accessToken) || string.IsNullOrWhiteSpace(accountId) ||
-            !TokenEmailMatches(idToken, expected.Label))
+            !TryReadTokenClaims(idToken, accountId, expected.Label, out _))
             throw new CodexClientException("订阅查询：本地登录账号无法确认一致");
 
         var offset = -(int)TimeZoneInfo.Local.GetUtcOffset(DateTimeOffset.Now).TotalMinutes;
@@ -72,15 +88,26 @@ internal sealed class SubscriptionLookup
         response.Content.Headers.ContentType?.MediaType == "text/html" &&
         response.Headers.Server.Any(value => value.Product?.Name?.Equals("cloudflare", StringComparison.OrdinalIgnoreCase) == true);
 
-    private static bool TokenEmailMatches(string? jwt, string expectedEmail)
+    private static bool TryReadTokenClaims(string? jwt, string accountId, string expectedEmail,
+        out DateTimeOffset? subscriptionExpiry)
     {
+        subscriptionExpiry = null;
         try
         {
             var part = jwt!.Split('.')[1].Replace('-', '+').Replace('_', '/');
             part = part.PadRight((part.Length + 3) / 4 * 4, '=');
             using var payload = JsonDocument.Parse(Convert.FromBase64String(part));
-            return payload.RootElement.TryGetProperty("email", out var email) &&
-                   string.Equals(email.GetString(), expectedEmail, StringComparison.OrdinalIgnoreCase);
+            var root = payload.RootElement;
+            var email = root.TryGetProperty("email", out var directEmail) ? directEmail.GetString() :
+                root.TryGetProperty("https://api.openai.com/profile", out var profile) &&
+                profile.TryGetProperty("email", out var profileEmail) ? profileEmail.GetString() : null;
+            if (!string.Equals(email, expectedEmail, StringComparison.OrdinalIgnoreCase) ||
+                !root.TryGetProperty("https://api.openai.com/auth", out var auth)) return false;
+            var tokenAccountId = auth.TryGetProperty("chatgpt_account_id", out var chatgptId) ? chatgptId.GetString() :
+                auth.TryGetProperty("account_id", out var fallbackId) ? fallbackId.GetString() : null;
+            if (!string.Equals(tokenAccountId, accountId, StringComparison.Ordinal)) return false;
+            subscriptionExpiry = ParseDateProperty(auth, "chatgpt_subscription_active_until");
+            return true;
         }
         catch { return false; }
     }
@@ -152,14 +179,27 @@ internal sealed class SubscriptionLookup
         if (FindMatchingExpiry(sample.RootElement, "wanted")?.UtcDateTime.Day != 1 ||
             FindMatchingExpiry(sample.RootElement, "missing") is not null)
             throw new InvalidOperationException("Subscription account isolation failed.");
+        var claim = """{"email":"alice@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"wanted","chatgpt_subscription_active_until":"1790975820000"}}""";
+        var token = "x." + Convert.ToBase64String(Encoding.UTF8.GetBytes(claim)).TrimEnd('=').Replace('+', '-').Replace('/', '_') + ".x";
+        if (!TryReadTokenClaims(token, "wanted", "alice@example.com", out var localExpiry) ||
+            localExpiry != DateTimeOffset.FromUnixTimeMilliseconds(1790975820000).ToLocalTime() ||
+            TryReadTokenClaims(token, "other", "alice@example.com", out _) ||
+            TryReadTokenClaims(token, "wanted", "bob@example.com", out _))
+            throw new InvalidOperationException("Subscription login claim validation failed.");
     }
 
     private static DateTimeOffset? ParseDateProperty(JsonElement node, string key)
     {
         if (node.ValueKind != JsonValueKind.Object || !node.TryGetProperty(key, out var value)) return null;
-        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var seconds))
-            return DateTimeOffset.FromUnixTimeSeconds(seconds).ToLocalTime();
-        return value.ValueKind == JsonValueKind.String && DateTimeOffset.TryParse(value.GetString(), out var date)
+        var raw = value.ValueKind is JsonValueKind.String or JsonValueKind.Number ? value.ToString() : null;
+        if (long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var timestamp))
+        {
+            try { return (timestamp > 1_000_000_000_000
+                ? DateTimeOffset.FromUnixTimeMilliseconds(timestamp)
+                : DateTimeOffset.FromUnixTimeSeconds(timestamp)).ToLocalTime(); }
+            catch (ArgumentOutOfRangeException) { return null; }
+        }
+        return DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date)
             ? date.ToLocalTime() : null;
     }
 }
