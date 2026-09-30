@@ -33,8 +33,12 @@ internal sealed class GlassWidget : Window
     private QuotaSnapshot? _snapshot;
     private HistoryGlass? _history;
     private Border? _panel;
+    private StackPanel? _panelBody;
+    private UniformGrid? _panelActions;
+    private ScrollViewer? _panelScroll;
     private TextBlock? _status;
     private bool _expanded;
+    private bool _creditsExpanded;
     private bool _pinned;
     private bool _refreshing;
     private bool _resetUncertain;
@@ -65,6 +69,7 @@ internal sealed class GlassWidget : Window
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.Manual;
         SourceInitialized += (_, _) => HideFromAltTab();
+        DpiChanged += (_, _) => Dispatcher.BeginInvoke(() => FitPanelToContent(), DispatcherPriority.Loaded);
         Content = _ring;
         _ring.MouseLeftButtonDown += RingDown;
         _ring.MouseMove += RingMove;
@@ -175,7 +180,11 @@ internal sealed class GlassWidget : Window
         {
             var next = await _client.ReadSnapshotAsync(CancellationToken.None, forceAccount);
             var oldAccount = _snapshot?.Account?.StorageKey;
-            if (oldAccount != next.Account?.StorageKey) _subscriptionError = null;
+            if (oldAccount != next.Account?.StorageKey)
+            {
+                _subscriptionError = null;
+                _creditsExpanded = false;
+            }
             var saved = next.Account is null ? null : _store.Load().FirstOrDefault(x => x.StorageKey == next.Account.StorageKey);
             if (next.Account is not null && saved?.SubscriptionExpiresAt is not null)
                 next = next with { Account = next.Account with { SubscriptionExpiresAt = saved.SubscriptionExpiresAt,
@@ -367,9 +376,8 @@ internal sealed class GlassWidget : Window
         var dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
         var area = WinForms.Screen.FromPoint(WinForms.Cursor.Position).WorkingArea;
         Width = 400;
-        Height = Math.Min(700, area.Height / dpi - 16);
         Left = Math.Clamp(anchor.X - Width / 2, area.Left / dpi, area.Right / dpi - Width);
-        Top = Math.Clamp(anchor.Y - 64, area.Top / dpi + 8, area.Bottom / dpi - Height - 8);
+        Top = anchor.Y - 64;
         RebuildPanel();
         if (_history?.IsVisible == true) PositionHistory();
     }
@@ -384,7 +392,7 @@ internal sealed class GlassWidget : Window
     {
         if (!_expanded) return;
         var s = _snapshot;
-        var body = new StackPanel { Margin = new Thickness(20, 15, 20, 16) };
+        var body = new StackPanel { Margin = new Thickness(20, 15, 20, 6) };
         var top = new Grid();
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition());
@@ -412,6 +420,7 @@ internal sealed class GlassWidget : Window
             if (e.LeftButton == MouseButtonState.Pressed)
             {
                 DragMove();
+                FitPanelToContent();
                 if (_history?.IsVisible == true) PositionHistory();
             }
         };
@@ -438,30 +447,43 @@ internal sealed class GlassWidget : Window
         Grid.SetColumn(all, 1);
         tokenGrid.Children.Add(today); tokenGrid.Children.Add(all);
         body.Children.Add(tokenGrid);
-        body.Children.Add(Text("重置机会明细", 12, Colors.White, FontWeights.SemiBold, 13));
-        if (s?.ResetCredits.Count > 0)
-            foreach (var credit in s.ResetCredits.Take(3))
-                body.Children.Add(Text($"{credit.Title}  ·  {credit.Status}\n获得 {credit.GrantedAt:MM-dd HH:mm}  ·  到期 {credit.ExpiresAt?.ToString("MM-dd HH:mm") ?? "未知"}",
-                    10, C("#BBCAD3"), FontWeights.Normal, 5));
-        else body.Children.Add(Text("未返回可用机会明细", 11, C("#94A5AF"), FontWeights.Normal, 6));
-        body.Children.Add(Text(_ring.IsStale ? "数据已过期 · 保留上次成功结果" :
-            $"更新于 {s?.FetchedAt:HH:mm:ss} · 每 30 秒刷新额度", 10,
-            _ring.IsStale ? C("#E7B47E") : C("#8EA2AC"), FontWeights.Normal, 13));
+        var footer = new Grid { Margin = new Thickness(0, 13, 0, 0) };
+        footer.ColumnDefinitions.Add(new ColumnDefinition());
+        footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        footer.Children.Add(Text(_ring.IsStale ? "数据已过期 · 保留上次结果" :
+            s is null ? "等待读取额度" : $"更新于 {s.FetchedAt:HH:mm} · 每 30 秒刷新", 10,
+            _ring.IsStale ? C("#E7B47E") : C("#8EA2AC"), FontWeights.Normal));
         var version = typeof(GlassWidget).Assembly.GetName().Version?.ToString(3) ?? "未知";
-        body.Children.Add(Text($"v{version} · 单文件版", 10, C("#8EA2AC"), FontWeights.Normal, 4));
-        _status = Text("", 10, C("#E7B47E"), FontWeights.Normal);
+        var versionText = Text($"v{version}", 10, C("#8EA2AC"), FontWeights.Normal);
+        Grid.SetColumn(versionText, 1); footer.Children.Add(versionText);
+        body.Children.Add(footer);
+        _status = Text("", 10, C("#E7B47E"), FontWeights.Normal, wrap: true);
+        var statusStyle = new Style(typeof(TextBlock));
+        var emptyStatus = new DataTrigger { Binding = new System.Windows.Data.Binding(nameof(TextBlock.Text))
+            { RelativeSource = new System.Windows.Data.RelativeSource(System.Windows.Data.RelativeSourceMode.Self) }, Value = "" };
+        emptyStatus.Setters.Add(new Setter(VisibilityProperty, Visibility.Collapsed));
+        statusStyle.Triggers.Add(emptyStatus);
+        _status.Style = statusStyle;
+        _status.SizeChanged += (sender, _) =>
+        {
+            if (IsLoaded && ReferenceEquals(sender, _status)) FitPanelToContent();
+        };
+        _status.IsVisibleChanged += (sender, _) =>
+        {
+            if (IsLoaded && ReferenceEquals(sender, _status)) FitPanelToContent();
+        };
         body.Children.Add(_status);
-        var actions = new UniformGrid { Columns = 4, Margin = new Thickness(0, 10, 0, 0) };
+        var actions = new UniformGrid { Columns = 3 };
         actions.Children.Add(Button("历史", ToggleHistory));
-        actions.Children.Add(BusyButton("reset", "使用重置", "处理中…", UseResetAsync));
         actions.Children.Add(Button("托盘", () => { _history?.Hide(); Hide(); }));
         actions.Children.Add(Button("退出", Exit));
-        actions.Margin = new Thickness(18, 8, 18, 16);
+        actions.Margin = new Thickness(18, 6, 18, 16);
         var layout = new Grid();
         layout.RowDefinitions.Add(new RowDefinition());
         layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        layout.Children.Add(new ScrollViewer { Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
+        var scroll = new ScrollViewer { Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        layout.Children.Add(scroll);
         Grid.SetRow(actions, 1); layout.Children.Add(actions);
         _panel = new Border
         {
@@ -473,13 +495,33 @@ internal sealed class GlassWidget : Window
         };
         var shell = new Border { Padding = new Thickness(3), Background = Brushes.Transparent,
             Child = _panel };
+        _panelBody = body;
+        _panelActions = actions;
+        _panelScroll = scroll;
         Content = shell;
-        body.Measure(new System.Windows.Size(Width - 8, double.PositiveInfinity));
-        actions.Measure(new System.Windows.Size(Width - 8, double.PositiveInfinity));
-        var dpi = VisualTreeHelper.GetDpi(this).DpiScaleY;
+        FitPanelToContent();
+    }
+
+    private Rect PanelWorkArea()
+    {
         var area = WinForms.Screen.FromHandle(new Interop.WindowInteropHelper(this).Handle).WorkingArea;
-        Height = Math.Min(Math.Ceiling(body.DesiredSize.Height + actions.DesiredSize.Height + 8), area.Height / dpi - 16);
-        Top = Math.Clamp(Top, area.Top / dpi + 8, area.Bottom / dpi - Height - 8);
+        var dpi = VisualTreeHelper.GetDpi(this);
+        return new Rect(area.Left / dpi.DpiScaleX, area.Top / dpi.DpiScaleY,
+            area.Width / dpi.DpiScaleX, area.Height / dpi.DpiScaleY);
+    }
+
+    private void FitPanelToContent(Rect? workArea = null)
+    {
+        if (!_expanded || _panelBody is null || _panelActions is null || _panelScroll is null) return;
+        _panelBody.Measure(new System.Windows.Size(Width - 8, double.PositiveInfinity));
+        _panelActions.Measure(new System.Windows.Size(Width - 8, double.PositiveInfinity));
+        var area = workArea ?? PanelWorkArea();
+        var desiredHeight = Math.Ceiling(_panelBody.DesiredSize.Height + _panelActions.DesiredSize.Height + 8);
+        var maximumHeight = area.Height - 16;
+        Height = Math.Min(desiredHeight, maximumHeight);
+        _panelScroll.VerticalScrollBarVisibility = desiredHeight > maximumHeight
+            ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled;
+        Top = Math.Clamp(Top, area.Top + 8, area.Bottom - Height - 8);
         if (_history?.IsVisible == true) PositionHistory();
     }
 
@@ -517,18 +559,100 @@ internal sealed class GlassWidget : Window
             BorderThickness = new Thickness(1), BorderBrush = new SolidColorBrush(C("#556D7684")) };
     }
 
-    private static Border CreditCard(QuotaSnapshot? s)
+    private Border CreditCard(QuotaSnapshot? s)
     {
-        var grid = new Grid(); grid.ColumnDefinitions.Add(new ColumnDefinition()); grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var label = new StackPanel();
-        label.Children.Add(Text("可用重置机会", 12, C("#C8F3D9"), FontWeights.SemiBold));
-        label.Children.Add(Text("只在确认后使用", 10, C("#9BBAAA"), FontWeights.Normal));
-        grid.Children.Add(label);
-        var count = Text(s?.AvailableResetCredits?.ToString() ?? "—", 20, C("#9AF0B5"), FontWeights.Bold);
-        Grid.SetColumn(count, 1); grid.Children.Add(count);
-        return new Border { Child = grid, Padding = new Thickness(12), Margin = new Thickness(0, 2, 0, 0),
-            Background = new SolidColorBrush(C("#69305243")), BorderBrush = new SolidColorBrush(C("#6A74A78B")),
+        var credits = (s?.ResetCredits ?? []).OrderBy(c => c.Status.Equals("available", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(c => c.ExpiresAt ?? DateTimeOffset.MaxValue).ToArray();
+        var earliestExpiry = credits.Where(c => c.Status.Equals("available", StringComparison.OrdinalIgnoreCase))
+            .Select(c => c.ExpiresAt).Min();
+        var stack = new StackPanel();
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.ColumnDefinitions.Add(new ColumnDefinition());
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(new Border { Width = 36, Height = 36, Margin = new Thickness(0, 0, 11, 0),
+            CornerRadius = new CornerRadius(18), Background = new SolidColorBrush(C("#3446A77F")),
+            BorderBrush = new SolidColorBrush(C("#6679C6AA")), BorderThickness = new Thickness(1),
+            Child = new TextBlock { Text = "\uE81E", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 18,
+                Foreground = new SolidColorBrush(C("#78EFBE")), HorizontalAlignment = HA.Center, VerticalAlignment = VerticalAlignment.Center } });
+        var label = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        label.Children.Add(Text("重置机会", 15, C("#D7F3E5"), FontWeights.SemiBold));
+        label.Children.Add(Text(earliestExpiry is { } expiry ? $"最早已知到期 · {expiry:MM-dd HH:mm}" :
+            s?.AvailableResetCredits == 0 ? "暂无可用机会" : "到期时间未提供", 10.5, C("#9DBEB2"), FontWeights.Normal, 3));
+        Grid.SetColumn(label, 1); header.Children.Add(label);
+        var count = Text(s?.AvailableResetCredits is { } n ? $"{n} 次" : "—", 25, C("#7FF2BA"), FontWeights.SemiBold);
+        count.VerticalAlignment = VerticalAlignment.Center;
+        Grid.SetColumn(count, 2); header.Children.Add(count);
+        stack.Children.Add(header);
+        if (_creditsExpanded)
+        {
+            foreach (var credit in credits)
+            {
+                stack.Children.Add(CreditDivider());
+                var row = new Grid { ToolTip = $"类型：{credit.Title}\n获得 {credit.GrantedAt:yyyy-MM-dd HH:mm}\n到期 {credit.ExpiresAt?.ToString("yyyy-MM-dd HH:mm") ?? "未知"}" };
+                row.ColumnDefinitions.Add(new ColumnDefinition());
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                var details = new StackPanel();
+                details.Children.Add(Text(credit.Title.StartsWith("Full reset", StringComparison.OrdinalIgnoreCase) ? "完整重置" : credit.Title,
+                    12, C("#E0F1E9"), FontWeights.SemiBold, wrap: true));
+                details.Children.Add(Text(credit.ExpiresAt is { } date ? $"{date:MM-dd HH:mm} 到期" : "到期时间未提供",
+                    11, C("#AEC6BD"), FontWeights.Normal, 3));
+                row.Children.Add(details);
+                var (status, color) = credit.Status.ToLowerInvariant() switch
+                {
+                    "available" => ("可用", C("#70EFBA")),
+                    "redeeming" => ("处理中", C("#FFBC68")),
+                    "redeemed" => ("已使用", C("#9AADA7")),
+                    "expired" => ("已到期", C("#9AADA7")),
+                    _ => ("状态未知", C("#B6C3BF"))
+                };
+                var state = new StackPanel { Orientation = SO.Horizontal, VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(12, 0, 0, 0) };
+                state.Children.Add(new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4),
+                    Background = new SolidColorBrush(color), Margin = new Thickness(0, 0, 7, 0), VerticalAlignment = VerticalAlignment.Center });
+                state.Children.Add(Text(status, 11, color, FontWeights.Normal));
+                Grid.SetColumn(state, 1); row.Children.Add(state);
+                stack.Children.Add(row);
+            }
+        }
+        stack.Children.Add(CreditDivider());
+        var actions = new Grid();
+        actions.ColumnDefinitions.Add(new ColumnDefinition());
+        actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var toggle = Button(credits.Length == 0 ? "暂无机会明细" : _creditsExpanded ? "收起明细" : $"查看 {credits.Length} 条明细", ToggleCreditDetails);
+        if (credits.Length > 0)
+        {
+            var toggleContent = new StackPanel { Orientation = SO.Horizontal };
+            toggleContent.Children.Add(new TextBlock { Text = _creditsExpanded ? "\uE70E" : "\uE70D",
+                FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 10, Margin = new Thickness(0, 0, 7, 0),
+                VerticalAlignment = VerticalAlignment.Center });
+            toggleContent.Children.Add(Text(_creditsExpanded ? "收起明细" : $"查看 {credits.Length} 条明细", 11, C("#CEE7DC"), FontWeights.Normal));
+            toggle.Content = toggleContent;
+        }
+        toggle.Background = Brushes.Transparent;
+        toggle.BorderThickness = new Thickness(0);
+        toggle.BorderBrush = Brushes.Transparent;
+        toggle.HorizontalAlignment = HA.Left;
+        toggle.IsEnabled = credits.Length > 0;
+        System.Windows.Automation.AutomationProperties.SetName(toggle,
+            _creditsExpanded ? "收起明细" : credits.Length == 0 ? "暂无机会明细" : $"查看 {credits.Length} 条明细");
+        actions.Children.Add(toggle);
+        var reset = BusyButton("reset", "使用重置", "处理中…", UseResetAsync, 94);
+        reset.BorderBrush = new SolidColorBrush(C("#8C7DCAA8"));
+        Grid.SetColumn(reset, 1); actions.Children.Add(reset);
+        stack.Children.Add(actions);
+        return new Border { Child = stack, Padding = new Thickness(12), Margin = new Thickness(0, 2, 0, 0),
+            Background = new LinearGradientBrush(C("#74305243"), C("#56213630"), 112), BorderBrush = new SolidColorBrush(C("#6A74A78B")),
             BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(14) };
+    }
+
+    private static Border CreditDivider() => new() { Height = 1, Margin = new Thickness(0, 6, 0, 6),
+        Background = new SolidColorBrush(C("#405F8E7C")) };
+
+    private void ToggleCreditDetails()
+    {
+        _creditsExpanded = !_creditsExpanded;
+        RebuildPanel();
     }
 
     private static Border AccountCard(QuotaSnapshot? s)
@@ -584,6 +708,7 @@ internal sealed class GlassWidget : Window
     private Button BusyButton(string key, string label, string busyLabel, Func<Task> action, double minWidth = 0)
     {
         var button = Button(label, () => _ = RunBusyActionAsync(key, action), minWidth);
+        button.Tag = key;
         _actionButtons[key] = (button, label, busyLabel);
         SetBusyVisual(button, label, key == "upgrade" ? _upgradeBusyLabel : busyLabel,
             _busyActions.Contains(key), key == "upgrade" ? _upgradeProgress : null);
@@ -623,7 +748,8 @@ internal sealed class GlassWidget : Window
     private static void SetBusyVisual(Button button, string label, string busyLabel, bool busy, int? progress = null)
     {
         button.IsEnabled = !busy;
-        button.Background = new SolidColorBrush(C(busy ? "#80616E87" : "#76485867"));
+        button.Background = new SolidColorBrush(C(busy ? "#80616E87" :
+            button.Tag as string == "reset" ? "#70467B66" : "#76485867"));
         if (!busy) { button.Content = label; return; }
         var content = new Grid { Width = Math.Max(button.MinWidth - 5, 40), Height = 22 };
         content.Children.Add(new TextBlock { Text = busyLabel, FontSize = 11, Foreground = new SolidColorBrush(C("#E4F2EE")),
@@ -648,7 +774,8 @@ internal sealed class GlassWidget : Window
     {
         var border = new FrameworkElementFactory(typeof(Border));
         border.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
-        border.SetValue(Border.BorderThicknessProperty, new Thickness(1));
+        border.SetBinding(Border.BorderThicknessProperty, new System.Windows.Data.Binding("BorderThickness")
+            { RelativeSource = new System.Windows.Data.RelativeSource(System.Windows.Data.RelativeSourceMode.TemplatedParent) });
         border.SetBinding(Border.BackgroundProperty, new System.Windows.Data.Binding("Background")
             { RelativeSource = new System.Windows.Data.RelativeSource(System.Windows.Data.RelativeSourceMode.TemplatedParent) });
         border.SetBinding(Border.BorderBrushProperty, new System.Windows.Data.Binding("BorderBrush")
@@ -723,12 +850,11 @@ internal sealed class GlassWidget : Window
     private void PositionHistory()
     {
         if (_history is null) return;
-        var dpi = VisualTreeHelper.GetDpi(this).DpiScaleX;
-        var area = WinForms.Screen.FromPoint(WinForms.Cursor.Position).WorkingArea;
-        _history.Height = Height;
-        _history.Left = Left - _history.Width + 1 >= area.Left / dpi
-            ? Left - _history.Width + 1 : Math.Min(Left + Width - 1, area.Right / dpi - _history.Width);
-        _history.Top = Math.Clamp(Top, area.Top / dpi, area.Bottom / dpi - _history.Height);
+        var area = PanelWorkArea();
+        _history.Height = Math.Min(Height, area.Height - 16);
+        _history.Left = Left - _history.Width + 1 >= area.Left
+            ? Left - _history.Width + 1 : Math.Max(area.Left, Math.Min(Left + Width - 1, area.Right - _history.Width));
+        _history.Top = Math.Clamp(Top, area.Top + 8, area.Bottom - _history.Height - 8);
     }
 
     private void ShowFromTray() { Show(); Activate(); }
@@ -871,13 +997,15 @@ internal sealed class GlassWidget : Window
 
     internal void RenderPreview()
     {
+        var previewTime = new DateTimeOffset(2026, 9, 30, 9, 46, 0, TimeSpan.FromHours(8));
         _snapshot = new QuotaSnapshot(
-            new RateWindow(300, 38, DateTimeOffset.Now.AddHours(2)),
-            new RateWindow(10080, 54, DateTimeOffset.Now.AddDays(3)), [], 2,
-            [new ResetCredit("Full reset", "available", DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddDays(12)),
-             new ResetCredit("Full reset", "available", DateTimeOffset.Now.AddDays(-2), DateTimeOffset.Now.AddDays(14))],
-            new UsageStats(null, 2_650_000_000), DateTimeOffset.Now,
-            new AccountSummary("PREVIEW", "sample@example.com", "plus", DateTimeOffset.Now.AddMonths(1)), "plus");
+            new RateWindow(300, 0, previewTime.AddHours(5)),
+            new RateWindow(10080, 54, new DateTimeOffset(2026, 10, 4, 11, 32, 0, previewTime.Offset)), [], 3,
+            [new ResetCredit("Full reset", "available", previewTime.AddDays(-7), new DateTimeOffset(2026, 10, 23, 3, 9, 0, previewTime.Offset)),
+             new ResetCredit("Full reset", "available", previewTime.AddDays(-25), new DateTimeOffset(2026, 10, 5, 7, 51, 0, previewTime.Offset)),
+             new ResetCredit("Full reset", "available", previewTime, new DateTimeOffset(2026, 10, 30, 2, 49, 0, previewTime.Offset))],
+            new UsageStats(null, 4_420_000_000), previewTime,
+            new AccountSummary("PREVIEW", "demo@example.com", "plus", new DateTimeOffset(2026, 10, 2, 23, 17, 0, previewTime.Offset)), "plus");
         _ring.Snapshot = _snapshot;
         Save(_ring, RingGeometry.FullSize, RingGeometry.FullSize, "preview-glass-circle.png");
         _ring.GlintOpacity = 1; _ring.GlintProgress = 0.18; _ring.InvalidateVisual();
@@ -894,18 +1022,58 @@ internal sealed class GlassWidget : Window
         _ring.Edge = DockEdge.None;
         _expanded = true;
         Width = 400; Height = 700;
+        var previewArea = new Rect(0, 0, 1920, 1400);
         _subscriptionError = "联网核验被拦截（403）；显示本地登录记录";
         RebuildPanel();
+        FitPanelToContent(previewArea);
+        var compactHeight = Height;
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel.png");
+        if (_panelScroll!.ComputedVerticalScrollBarVisibility != Visibility.Collapsed)
+            throw new InvalidOperationException("A fitting compact panel must not show a scrollbar.");
+        ToggleCreditDetails();
+        FitPanelToContent(previewArea);
+        var expandedHeight = Height;
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-credits.png");
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-credits-125.png", 1.25);
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-credits-150.png", 1.5);
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-design-compare.png", 2.245);
+        if (expandedHeight <= compactHeight || _panelScroll!.ComputedVerticalScrollBarVisibility != Visibility.Collapsed)
+            throw new InvalidOperationException("Credit expansion must grow the panel without scrolling when it fits.");
+        RebuildPanel();
+        FitPanelToContent(previewArea);
+        if (!_creditsExpanded || Height != expandedHeight)
+            throw new InvalidOperationException("Panel refresh must preserve expanded credit details.");
+        ToggleCreditDetails();
+        FitPanelToContent(previewArea);
+        if (Height != compactHeight)
+            throw new InvalidOperationException("Collapsing credit details must restore the compact panel height.");
+        var previewSnapshot = _snapshot;
+        _snapshot = _snapshot with { AvailableResetCredits = 0, ResetCredits = [] };
+        RebuildPanel();
+        FitPanelToContent(previewArea);
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-empty.png");
+        _snapshot = previewSnapshot with { AvailableResetCredits = 20,
+            ResetCredits = Enumerable.Range(0, 20).Select(i => new ResetCredit("Full reset", "available",
+                previewTime.AddDays(-1), previewTime.AddDays(4 + i))).ToArray() };
+        ToggleCreditDetails();
+        FitPanelToContent(new Rect(0, 0, 1920, 720));
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-overflow.png");
+        if (Height != 704 || _panelScroll!.ComputedVerticalScrollBarVisibility != Visibility.Visible ||
+            _panelScroll.ExtentHeight <= _panelScroll.ViewportHeight)
+            throw new InvalidOperationException("Oversized details must scroll within the screen while keeping actions visible.");
+        _snapshot = previewSnapshot;
+        _creditsExpanded = false;
         _busyActions.Add("open");
         _busyActions.Add("subscription");
         _busyActions.Add("reset");
         RebuildPanel();
+        FitPanelToContent(previewArea);
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-busy.png");
         _busyActions.Clear();
         _busyActions.Add("upgrade");
         SetUpgradeVisual("下载中", 42);
         RebuildPanel();
+        FitPanelToContent(previewArea);
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-downloading.png");
         _busyActions.Clear();
         _upgradeBusyLabel = "检查中…";
@@ -932,12 +1100,13 @@ internal sealed class GlassWidget : Window
             if (Directory.Exists(previewDirectory)) Directory.Delete(previewDirectory, true);
         }
 
-        static void Save(UIElement element, int width, int height, string name)
+        static void Save(UIElement element, int width, int height, string name, double scale = 1)
         {
             element.Measure(new System.Windows.Size(width, height));
             element.Arrange(new Rect(0, 0, width, height));
             element.UpdateLayout();
-            var bitmap = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
+            var bitmap = new RenderTargetBitmap((int)Math.Ceiling(width * scale), (int)Math.Ceiling(height * scale),
+                96 * scale, 96 * scale, PixelFormats.Pbgra32);
             bitmap.Render(element);
             var encoder = new PngBitmapEncoder();
             encoder.Frames.Add(BitmapFrame.Create(bitmap));
