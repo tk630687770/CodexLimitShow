@@ -67,7 +67,7 @@ internal static class WpfMain
         if (args.Contains("--render-preview", StringComparer.OrdinalIgnoreCase))
         {
             var previewApp = new Application();
-            var widget = new GlassWidget();
+            var widget = new GlassWidget(preview: true);
             widget.RenderPreview();
             widget.Close();
             return;

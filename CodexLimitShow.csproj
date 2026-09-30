@@ -8,14 +8,15 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CodexLimitShow</AssemblyName>
     <RootNamespace>CodexLimitShow</RootNamespace>
-    <Version>2.2.0</Version>
-    <InformationalVersion>2.2.0</InformationalVersion>
+    <Version>2.3.0</Version>
+    <InformationalVersion>2.3.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <AssemblyVersion>2.2.0.0</AssemblyVersion>
-    <FileVersion>2.2.0.0</FileVersion>
+    <AssemblyVersion>2.3.0.0</AssemblyVersion>
+    <FileVersion>2.3.0.0</FileVersion>
   </PropertyGroup>
   <ItemGroup>
     <Compile Remove="Program.cs" />
     <Compile Remove="backups\**\*.cs" />
+    <Resource Include="Assets\codex-logo.png" />
   </ItemGroup>
 </Project>

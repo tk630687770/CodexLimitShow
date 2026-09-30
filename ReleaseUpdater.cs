@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -15,23 +17,144 @@ internal sealed class ReleaseUpdater
     public const string ExecutableName = "CodexLimitShow.exe";
     private const string Repository = "tk630687770/CodexLimitShow";
     private const long MaximumBytes = 250_000_000;
+    private const int MaximumMetadataBytes = 1_048_576;
     private static readonly HttpClient Github = CreateGithubClient();
     private readonly Func<string, Version?> _readVersion;
+    private readonly HttpClient _github;
+    private readonly string _cachePath;
+    private readonly Func<DateTimeOffset> _utcNow;
+    private readonly SemaphoreSlim _checkGate = new(1, 1);
+    private DateTimeOffset? _lastAttemptUtc;
+    private string? _etag;
 
-    public ReleaseUpdater(Func<string, Version?>? readVersion = null) =>
+    private sealed record UpdateCheckCache(DateTimeOffset LastAttemptUtc, string? ETag,
+        string? Version, string? DownloadUrl, string? Sha256);
+
+    public static TimeSpan AutomaticCheckInterval => TimeSpan.FromHours(24);
+    public RemoteReleaseCandidate? CachedRelease { get; private set; }
+    public TimeSpan AutomaticCheckDelay
+    {
+        get
+        {
+            var now = _utcNow();
+            if (_lastAttemptUtc is null) return TimeSpan.Zero;
+            if (_lastAttemptUtc > now)
+            {
+                // A clock rollback must not postpone checks indefinitely or cause restart retries.
+                _lastAttemptUtc = now;
+                SaveCheckCache();
+            }
+            var delay = _lastAttemptUtc.Value + AutomaticCheckInterval - now;
+            return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
+        }
+    }
+
+    public ReleaseUpdater(Func<string, Version?>? readVersion = null, HttpClient? github = null,
+        string? cachePath = null, Func<DateTimeOffset>? utcNow = null)
+    {
         _readVersion = readVersion ?? ReadVersion;
+        _github = github ?? Github;
+        _cachePath = cachePath ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CodexLimitShow", "update-check.json");
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+        LoadCheckCache();
+    }
 
     public Version? CurrentVersion(string? executable) =>
         string.IsNullOrWhiteSpace(executable) ? null : _readVersion(executable);
 
-    public async Task<RemoteReleaseCandidate?> CheckRemoteAsync(CancellationToken cancellationToken)
+    public Task<RemoteReleaseCandidate?> CheckRemoteAsync(CancellationToken cancellationToken) =>
+        CheckAsync(automatic: false, cancellationToken);
+
+    public Task<RemoteReleaseCandidate?> CheckAutomaticallyAsync(CancellationToken cancellationToken) =>
+        CheckAsync(automatic: true, cancellationToken);
+
+    private async Task<RemoteReleaseCandidate?> CheckAsync(bool automatic, CancellationToken cancellationToken)
     {
-        using var response = await Github.GetAsync($"https://api.github.com/repos/{Repository}/releases/latest", cancellationToken);
-        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
-        response.EnsureSuccessStatusCode();
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-        return ParseRemoteRelease(document.RootElement);
+        await _checkGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (automatic && AutomaticCheckDelay > TimeSpan.Zero) return CachedRelease;
+            _lastAttemptUtc = _utcNow();
+            SaveCheckCache();
+            using var request = new HttpRequestMessage(HttpMethod.Get,
+                $"https://api.github.com/repos/{Repository}/releases/latest");
+            if (EntityTagHeaderValue.TryParse(_etag, out var tag)) request.Headers.IfNoneMatch.Add(tag);
+            using var response = await _github.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.NotModified) return CachedRelease;
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                CachedRelease = null;
+                _etag = null;
+            }
+            else
+            {
+                response.EnsureSuccessStatusCode();
+                if (response.Content.Headers.ContentLength > MaximumMetadataBytes)
+                    throw new InvalidDataException("GitHub 版本信息超出大小限制。");
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                using var payload = new MemoryStream();
+                var buffer = new byte[16_384];
+                int read;
+                while ((read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                {
+                    if (payload.Length + read > MaximumMetadataBytes)
+                        throw new InvalidDataException("GitHub 版本信息超出大小限制。");
+                    payload.Write(buffer, 0, read);
+                }
+                using var document = JsonDocument.Parse(payload.GetBuffer().AsMemory(0, (int)payload.Length));
+                CachedRelease = ParseRemoteRelease(document.RootElement);
+                _etag = response.Headers.ETag?.ToString();
+            }
+            SaveCheckCache();
+            return CachedRelease;
+        }
+        finally { _checkGate.Release(); }
+    }
+
+    private void LoadCheckCache()
+    {
+        try
+        {
+            if (!File.Exists(_cachePath) || new FileInfo(_cachePath).Length > 16_384) return;
+            var cache = JsonSerializer.Deserialize<UpdateCheckCache>(File.ReadAllText(_cachePath));
+            if (cache is null) return;
+            var now = _utcNow();
+            _lastAttemptUtc = cache.LastAttemptUtc < DateTimeOffset.UnixEpoch || cache.LastAttemptUtc > now
+                ? now : cache.LastAttemptUtc;
+            if (cache.Version is null && cache.DownloadUrl is null && cache.Sha256 is null)
+                _etag = EntityTagHeaderValue.TryParse(cache.ETag, out var emptyTag) ? emptyTag.ToString() : null;
+            else if (Version.TryParse(cache.Version, out var version) &&
+                cache.DownloadUrl == $"https://github.com/{Repository}/releases/download/v{version}/{ExecutableName}" &&
+                cache.Sha256 is { Length: 64 } && cache.Sha256.All(Uri.IsHexDigit))
+            {
+                CachedRelease = new RemoteReleaseCandidate(version, cache.DownloadUrl, cache.Sha256);
+                _etag = EntityTagHeaderValue.TryParse(cache.ETag, out var tag) ? tag.ToString() : null;
+            }
+            if (_lastAttemptUtc != cache.LastAttemptUtc) SaveCheckCache();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { }
+    }
+
+    private void SaveCheckCache()
+    {
+        if (_lastAttemptUtc is null) return;
+        var temporary = _cachePath + $".{Guid.NewGuid():N}.tmp";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_cachePath))!);
+            var cache = new UpdateCheckCache(_lastAttemptUtc.Value, _etag, CachedRelease?.Version.ToString(),
+                CachedRelease?.DownloadUrl, CachedRelease?.Sha256);
+            File.WriteAllText(temporary, JsonSerializer.Serialize(cache));
+            File.Move(temporary, _cachePath, overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
     }
 
     private static RemoteReleaseCandidate? ParseRemoteRelease(JsonElement release)
@@ -62,7 +185,7 @@ internal sealed class ReleaseUpdater
         var destination = Path.Combine(directory, $"CodexLimitShow-update-{Guid.NewGuid():N}.exe");
         try
         {
-            using var response = await Github.GetAsync(remote.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+            using var response = await _github.GetAsync(remote.DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                 .ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
             var expectedBytes = response.Content.Headers.ContentLength;
@@ -170,7 +293,11 @@ internal sealed class ReleaseUpdater
 
     private static HttpClient CreateGithubClient()
     {
-        var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+        var client = new HttpClient(new HttpClientHandler
+        {
+            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+            UseCookies = false
+        }) { Timeout = TimeSpan.FromMinutes(10) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("CodexLimitShow/1");
         client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
         return client;
@@ -210,6 +337,7 @@ internal sealed class ReleaseUpdater
         try
         {
             Directory.CreateDirectory(root);
+            SelfTestMetadata(root, releaseJson);
             var source = Path.Combine(UpdateDirectory(), $"CodexLimitShow-update-{Guid.NewGuid():N}.exe");
             var target = Path.Combine(root, ExecutableName);
             Directory.CreateDirectory(UpdateDirectory());
@@ -218,7 +346,7 @@ internal sealed class ReleaseUpdater
             try
             {
                 var service = new ReleaseUpdater(path => path.Equals(source, StringComparison.OrdinalIgnoreCase)
-                    ? new Version(2, 0, 0) : new Version(1, 0, 0));
+                    ? new Version(2, 0, 0) : new Version(1, 0, 0), cachePath: Path.Combine(root, "apply-cache.json"));
                 var hash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(source)));
                 var rejected = false;
                 try { service.Apply(source, target, int.MaxValue, new string('0', 64)); }
@@ -237,5 +365,78 @@ internal sealed class ReleaseUpdater
                 throw new InvalidOperationException("拒绝清理非测试目录。");
             if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
         }
+    }
+
+    private static void SelfTestMetadata(string root, string releaseJson)
+    {
+        var now = new DateTimeOffset(2026, 9, 30, 0, 0, 0, TimeSpan.Zero);
+        var calls = 0;
+        using var github = new HttpClient(new MetadataTestHandler(request =>
+        {
+            if (request.RequestUri?.AbsoluteUri != $"https://api.github.com/repos/{Repository}/releases/latest")
+                throw new Exception("Automatic update check attempted a non-metadata URL.");
+            calls++;
+            if (calls is 2 or 3 && request.Headers.IfNoneMatch.SingleOrDefault()?.ToString() != "\"release-1\"")
+                throw new Exception("Update ETag was not reused.");
+            if (calls == 3) throw new HttpRequestException("Simulated offline check.");
+            var response = new HttpResponseMessage(calls == 1 ? HttpStatusCode.OK :
+                calls == 2 ? HttpStatusCode.NotModified : HttpStatusCode.NotFound);
+            if (calls == 1)
+            {
+                response.Content = new StringContent(releaseJson);
+                response.Headers.ETag = new EntityTagHeaderValue("\"release-1\"");
+            }
+            return response;
+        }));
+        var cachePath = Path.Combine(root, "check-cache.json");
+        var service = new ReleaseUpdater(github: github, cachePath: cachePath, utcNow: () => now);
+        if (service.AutomaticCheckDelay != TimeSpan.Zero ||
+            service.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult()?.Version != new Version(2, 0, 0))
+            throw new Exception("First automatic metadata check failed.");
+        service.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult();
+        var restarted = new ReleaseUpdater(github: github, cachePath: cachePath, utcNow: () => now);
+        if (calls != 1 || restarted.AutomaticCheckDelay != AutomaticCheckInterval ||
+            restarted.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult() != service.CachedRelease || calls != 1)
+            throw new Exception("Restart or repeated automatic check bypassed the 24-hour interval.");
+        now += AutomaticCheckInterval;
+        if (restarted.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult()?.Version != new Version(2, 0, 0) || calls != 2)
+            throw new Exception("Conditional metadata check lost the cached release.");
+        var failed = false;
+        try { restarted.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (HttpRequestException) { failed = true; }
+        var afterFailure = new ReleaseUpdater(github: github, cachePath: cachePath, utcNow: () => now);
+        if (!failed || calls != 3 || afterFailure.CachedRelease is null ||
+            afterFailure.AutomaticCheckDelay != AutomaticCheckInterval)
+            throw new Exception("Failed check lost its candidate or retry timestamp.");
+        afterFailure.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult();
+        if (calls != 3) throw new Exception("Failed check was retried automatically too soon.");
+        if (afterFailure.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult() is not null || calls != 4)
+            throw new Exception("Manual checks were throttled or a missing release retained stale metadata.");
+
+        File.WriteAllText(cachePath, JsonSerializer.Serialize(new UpdateCheckCache(now.AddYears(100), "\"bad\"",
+            "2.0.0", "https://example.invalid/untrusted.exe", new string('a', 64))));
+        var untrusted = new ReleaseUpdater(github: github, cachePath: cachePath, utcNow: () => now);
+        if (untrusted.CachedRelease is not null || untrusted.AutomaticCheckDelay != AutomaticCheckInterval)
+            throw new Exception("Untrusted cache or future timestamp was accepted.");
+        now += AutomaticCheckInterval;
+        if (untrusted.AutomaticCheckDelay != TimeSpan.Zero)
+            throw new Exception("Future clock timestamp postponed checks indefinitely.");
+        File.WriteAllText(cachePath, "not-json");
+        var corrupt = new ReleaseUpdater(github: github, cachePath: cachePath, utcNow: () => now);
+        if (corrupt.CachedRelease is not null || corrupt.AutomaticCheckDelay != TimeSpan.Zero)
+            throw new Exception("Corrupt update cache was not ignored.");
+        using var oversizedGithub = new HttpClient(new MetadataTestHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+            { Content = new StringContent(new string(' ', MaximumMetadataBytes + 1)) }));
+        var oversized = new ReleaseUpdater(github: oversizedGithub, cachePath: Path.Combine(root, "large-cache.json"), utcNow: () => now);
+        var rejected = false;
+        try { oversized.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (InvalidDataException) { rejected = true; }
+        if (!rejected) throw new Exception("Oversized release metadata was accepted.");
+    }
+
+    private sealed class MetadataTestHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(respond(request));
     }
 }

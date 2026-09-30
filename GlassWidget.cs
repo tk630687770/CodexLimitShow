@@ -6,6 +6,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using System.Windows.Media.Imaging;
 using WinForms = System.Windows.Forms;
@@ -22,6 +23,8 @@ internal sealed class GlassWidget : Window
     private readonly ReleaseUpdater _releaseUpdater = new();
     private readonly DualRing _ring = new();
     private readonly DispatcherTimer _refreshTimer = new() { Interval = TimeSpan.FromSeconds(30) };
+    private readonly DispatcherTimer _updateTimer = new();
+    private readonly CancellationTokenSource _lifetime = new();
     private readonly DispatcherTimer _glintTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
     private readonly DispatcherTimer _clickTimer = new() { Interval = TimeSpan.FromMilliseconds(WinForms.SystemInformation.DoubleClickTime) };
     private readonly Drawing.Icon _appIcon = CreateAppIcon();
@@ -29,7 +32,10 @@ internal sealed class GlassWidget : Window
     private readonly HashSet<string> _subscriptionAttempted = [];
     private readonly HashSet<string> _expiryContradictionChecked = [];
     private readonly HashSet<string> _busyActions = [];
-    private readonly Dictionary<string, (Button Control, string Label, string BusyLabel)> _actionButtons = [];
+    private readonly Dictionary<string, (Button Control, string Label, string BusyLabel, Grid? Icon)> _actionButtons = [];
+    private TextBlock? _updateReminder;
+    private System.Windows.Shapes.Ellipse? _updateBadge;
+    private Version? _availableUpdate;
     private QuotaSnapshot? _snapshot;
     private HistoryGlass? _history;
     private Border? _panel;
@@ -55,7 +61,7 @@ internal sealed class GlassWidget : Window
     private double _glint;
     private string? _subscriptionError;
 
-    public GlassWidget()
+    public GlassWidget(bool preview = false)
     {
         Title = "Codex 用量";
         Width = RingGeometry.FullSize;
@@ -92,6 +98,8 @@ internal sealed class GlassWidget : Window
         _tray.ContextMenuStrip.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Exit));
         _tray.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
         _refreshTimer.Tick += (_, _) => _ = RefreshAsync();
+        _updateTimer.Tick += (_, _) => { _updateTimer.Stop(); _ = CheckForUpdateAutomaticallyAsync(); };
+        IsVisibleChanged += (_, _) => UpdateUpgradeReminder();
         _glintTimer.Tick += (_, _) =>
         {
             _glint = (_glint + 0.03) % 1;
@@ -105,13 +113,19 @@ internal sealed class GlassWidget : Window
             Left = area.Right / scale - Width - 26;
             Top = area.Top / scale + 80;
             _collapsedLocation = new System.Windows.Point(Left, Top);
+            if (preview) return;
             _refreshTimer.Start();
             _ = RefreshAsync();
+            SetAvailableRelease(_releaseUpdater.CachedRelease);
+            _ = CheckForUpdateAutomaticallyAsync();
         };
         Deactivated += (_, _) => Dispatcher.BeginInvoke(CollapseIfOutside, DispatcherPriority.Background);
         Closed += (_, _) =>
         {
             _refreshTimer.Stop();
+            _updateTimer.Stop();
+            _lifetime.Cancel();
+            _updateReminder?.BeginAnimation(OpacityProperty, null);
             _glintTimer.Stop();
             _clickTimer.Stop();
             _history?.Close();
@@ -365,6 +379,7 @@ internal sealed class GlassWidget : Window
             _history?.Hide();
             Content = _ring;
             _expanded = false;
+            UpdateUpgradeReminder();
             SetRingEdge(_edge);
             Left = _collapsedLocation.X;
             Top = _collapsedLocation.Y;
@@ -391,6 +406,8 @@ internal sealed class GlassWidget : Window
     private void RebuildPanel()
     {
         if (!_expanded) return;
+        _updateReminder?.BeginAnimation(OpacityProperty, null);
+        _updateBadge = null;
         var s = _snapshot;
         var body = new StackPanel { Margin = new Thickness(20, 15, 20, 6) };
         var top = new Grid();
@@ -399,19 +416,33 @@ internal sealed class GlassWidget : Window
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var collapse = Button("‹", ToggleExpanded, 26);
-        collapse.Width = 26;
-        collapse.ToolTip = _edge == DockEdge.None ? "收起为双圈" : "收起为停靠条";
+        var collapse = IconButton(_edge == DockEdge.None ? "收起为双圈" : "收起为停靠条",
+            Symbol("\uE73F"), ToggleExpanded);
         top.Children.Add(collapse);
         var title = Text("CODEX  /  LIMITS", 11, C("#92A5AE"), FontWeights.SemiBold);
         title.VerticalAlignment = VerticalAlignment.Center;
         title.Margin = new Thickness(6, 0, 0, 0);
         Grid.SetColumn(title, 1); top.Children.Add(title);
-        var openCodex = BusyButton("open", "打开 Codex", "打开中…", OpenCodexAsync, 84);
+        var openCodex = BusyIconButton("open", "打开 Codex", "打开中…",
+            new System.Windows.Controls.Image { Width = 18, Height = 18,
+                Source = new BitmapImage(new Uri("pack://application:,,,/Assets/codex-logo.png")),
+                Stretch = Stretch.Uniform, HorizontalAlignment = HA.Center, VerticalAlignment = VerticalAlignment.Center },
+            OpenCodexAsync);
         Grid.SetColumn(openCodex, 2); top.Children.Add(openCodex);
-        var upgrade = BusyButton("upgrade", "升级", "检查中…", UpgradeAsync, 52);
+        _updateReminder = Symbol("\uE777");
+        var upgrade = BusyIconButton("upgrade", "检查升级", "检查中…", _updateReminder, UpgradeAsync);
+        _updateBadge = new System.Windows.Shapes.Ellipse { Width = 4, Height = 4, Fill = new SolidColorBrush(C("#70E9B0")),
+            HorizontalAlignment = HA.Right, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false };
+        ((Grid)upgrade.Content).Children.Add(_updateBadge);
         Grid.SetColumn(upgrade, 3); top.Children.Add(upgrade);
-        var pin = Button(_pinned ? "● 固定" : "◇ 固定", () => { _pinned = !_pinned; RebuildPanel(); }, 66);
+        var pin = IconButton(_pinned ? "取消固定" : "固定位置", Symbol("\uE718"),
+            () => { _pinned = !_pinned; RebuildPanel(); });
+        if (_pinned)
+        {
+            pin.Background = new SolidColorBrush(C("#865B507C"));
+            pin.BorderBrush = new SolidColorBrush(C("#B6B699DC"));
+        }
+        System.Windows.Automation.AutomationProperties.SetHelpText(pin, _pinned ? "当前已固定" : "当前未固定");
         Grid.SetColumn(pin, 4); top.Children.Add(pin);
         top.Cursor = Cursors.SizeAll;
         top.MouseLeftButtonDown += (_, e) =>
@@ -500,6 +531,7 @@ internal sealed class GlassWidget : Window
         _panelScroll = scroll;
         Content = shell;
         FitPanelToContent();
+        UpdateUpgradeReminder();
     }
 
     private Rect PanelWorkArea()
@@ -705,11 +737,43 @@ internal sealed class GlassWidget : Window
         return button;
     }
 
+    private static TextBlock Symbol(string glyph) => new()
+    {
+        Text = glyph, FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 16,
+        Foreground = new SolidColorBrush(C("#E4F2EE")), HorizontalAlignment = HA.Center,
+        VerticalAlignment = VerticalAlignment.Center, IsHitTestVisible = false
+    };
+
+    private static Button IconButton(string label, UIElement icon, Action action)
+    {
+        var button = Button("", action, 32);
+        button.Width = 32; button.Height = 30;
+        button.Content = icon; button.ToolTip = label;
+        ToolTipService.SetShowOnDisabled(button, true);
+        System.Windows.Automation.AutomationProperties.SetName(button, label);
+        return button;
+    }
+
+    private Button BusyIconButton(string key, string label, string busyLabel, UIElement icon, Func<Task> action)
+    {
+        var content = new Grid { Width = 26, Height = 24 };
+        content.Children.Add(icon);
+        content.Children.Add(new System.Windows.Controls.ProgressBar { Height = 2,
+            VerticalAlignment = VerticalAlignment.Bottom, Minimum = 0, Maximum = 100,
+            Foreground = new SolidColorBrush(C("#70E9B0")), Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0), IsHitTestVisible = false });
+        var button = IconButton(label, content, () => _ = RunBusyActionAsync(key, action));
+        button.Tag = key;
+        _actionButtons[key] = (button, label, busyLabel, content);
+        UpdateBusyVisual(key);
+        return button;
+    }
+
     private Button BusyButton(string key, string label, string busyLabel, Func<Task> action, double minWidth = 0)
     {
         var button = Button(label, () => _ = RunBusyActionAsync(key, action), minWidth);
         button.Tag = key;
-        _actionButtons[key] = (button, label, busyLabel);
+        _actionButtons[key] = (button, label, busyLabel, null);
         SetBusyVisual(button, label, key == "upgrade" ? _upgradeBusyLabel : busyLabel,
             _busyActions.Contains(key), key == "upgrade" ? _upgradeProgress : null);
         return button;
@@ -735,7 +799,8 @@ internal sealed class GlassWidget : Window
     {
         if (_actionButtons.TryGetValue(key, out var item))
             SetBusyVisual(item.Control, item.Label, key == "upgrade" ? _upgradeBusyLabel : item.BusyLabel,
-                _busyActions.Contains(key), key == "upgrade" ? _upgradeProgress : null);
+                _busyActions.Contains(key), key == "upgrade" ? _upgradeProgress : null, item.Icon);
+        if (key == "upgrade") UpdateUpgradeReminder();
     }
 
     private void SetUpgradeVisual(string label, int? progress)
@@ -745,11 +810,21 @@ internal sealed class GlassWidget : Window
         UpdateBusyVisual("upgrade");
     }
 
-    private static void SetBusyVisual(Button button, string label, string busyLabel, bool busy, int? progress = null)
+    private static void SetBusyVisual(Button button, string label, string busyLabel, bool busy, int? progress = null, Grid? icon = null)
     {
         button.IsEnabled = !busy;
         button.Background = new SolidColorBrush(C(busy ? "#80616E87" :
             button.Tag as string == "reset" ? "#70467B66" : "#76485867"));
+        if (icon is not null)
+        {
+            var bar = (System.Windows.Controls.ProgressBar)icon.Children[1];
+            bar.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+            bar.IsIndeterminate = busy && progress is null;
+            bar.Value = progress ?? 0;
+            button.ToolTip = busy ? $"{label} · {busyLabel}{(progress is { } p ? $" {p}%" : "")}" : label;
+            System.Windows.Automation.AutomationProperties.SetHelpText(button, busy ? (string)button.ToolTip : "");
+            return;
+        }
         if (!busy) { button.Content = label; return; }
         var content = new Grid { Width = Math.Max(button.MinWidth - 5, 40), Height = 22 };
         content.Children.Add(new TextBlock { Text = busyLabel, FontSize = 11, Foreground = new SolidColorBrush(C("#E4F2EE")),
@@ -858,6 +933,59 @@ internal sealed class GlassWidget : Window
     }
 
     private void ShowFromTray() { Show(); Activate(); }
+
+    private void SetAvailableRelease(RemoteReleaseCandidate? release)
+    {
+        var current = Version.Parse(typeof(GlassWidget).Assembly.GetName().Version!.ToString(3));
+        _availableUpdate = release?.Version > current ? release.Version : null;
+        UpdateUpgradeReminder();
+    }
+
+    private void UpdateUpgradeReminder()
+    {
+        if (_updateReminder is null) return;
+        _updateReminder.BeginAnimation(OpacityProperty, null);
+        _updateReminder.Opacity = 1;
+        var remind = _availableUpdate is not null && !_busyActions.Contains("upgrade");
+        _updateReminder.Foreground = new SolidColorBrush(C(remind ? "#70E9B0" : "#E4F2EE"));
+        if (_updateBadge is not null) _updateBadge.Visibility = remind ? Visibility.Visible : Visibility.Collapsed;
+        if (!_busyActions.Contains("upgrade") && _actionButtons.TryGetValue("upgrade", out var button))
+        {
+            button.Control.ToolTip = remind ? $"发现新版 v{_availableUpdate} · 点击升级" : "检查升级 · 每 24 小时自动检查";
+            System.Windows.Automation.AutomationProperties.SetHelpText(button.Control, (string)button.Control.ToolTip);
+        }
+        if (remind && _expanded && IsVisible && !_lifetime.IsCancellationRequested && SystemParameters.ClientAreaAnimation)
+            _updateReminder.BeginAnimation(OpacityProperty, new DoubleAnimation(0.45, 1, TimeSpan.FromSeconds(1.2))
+                { AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever });
+    }
+
+    private void ScheduleAutomaticUpdateCheck()
+    {
+        _updateTimer.Stop();
+        if (_lifetime.IsCancellationRequested) return;
+        var delay = _releaseUpdater.AutomaticCheckDelay;
+        _updateTimer.Interval = delay > TimeSpan.FromSeconds(1) ? delay : TimeSpan.FromSeconds(1);
+        _updateTimer.Start();
+    }
+
+    private async Task CheckForUpdateAutomaticallyAsync()
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var release = await _releaseUpdater.CheckAutomaticallyAsync(timeout.Token);
+            if (!_lifetime.IsCancellationRequested) SetAvailableRelease(release);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or
+            System.Text.Json.JsonException or InvalidDataException or InvalidOperationException or KeyNotFoundException or FormatException)
+        {
+            // A failed background check must not disturb quota display or erase a known update.
+            if (!_lifetime.IsCancellationRequested) SetAvailableRelease(_releaseUpdater.CachedRelease);
+        }
+        finally { ScheduleAutomaticUpdateCheck(); }
+    }
+
     private async Task UpgradeAsync()
     {
         if (_upgradeBusy) return;
@@ -873,6 +1001,7 @@ internal sealed class GlassWidget : Window
             {
                 using var checkTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                 remote = await _releaseUpdater.CheckRemoteAsync(checkTimeout.Token);
+                SetAvailableRelease(remote);
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
             { remoteError = ex; }
@@ -932,6 +1061,7 @@ internal sealed class GlassWidget : Window
             _upgradeBusyLabel = "检查中…";
             _upgradeProgress = null;
             if (_status is not null && IsLoaded) _status.Text = "";
+            ScheduleAutomaticUpdateCheck();
         }
     }
 
@@ -1030,6 +1160,38 @@ internal sealed class GlassWidget : Window
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel.png");
         if (_panelScroll!.ComputedVerticalScrollBarVisibility != Visibility.Collapsed)
             throw new InvalidOperationException("A fitting compact panel must not show a scrollbar.");
+        foreach (var key in new[] { "open", "upgrade" })
+            if (_actionButtons[key].Control.Width != 32 || _actionButtons[key].Icon is null ||
+                string.IsNullOrWhiteSpace(System.Windows.Automation.AutomationProperties.GetName(_actionButtons[key].Control)))
+                throw new InvalidOperationException("Header icon buttons must remain compact and accessible.");
+        _availableUpdate = new Version(99, 0, 0);
+        UpdateUpgradeReminder();
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-update.png");
+        if (_updateBadge!.Visibility != Visibility.Visible || _updateReminder!.HasAnimatedProperties)
+            throw new InvalidOperationException("Hidden panels must show a static update badge without running an animation.");
+        Show();
+        UpdateUpgradeReminder();
+        if (SystemParameters.ClientAreaAnimation && !_updateReminder.HasAnimatedProperties)
+            throw new InvalidOperationException("A visible new-version icon must animate when system animations are enabled.");
+        var previousReminder = _updateReminder;
+        RebuildPanel();
+        if (previousReminder.HasAnimatedProperties || ReferenceEquals(previousReminder, _updateReminder))
+            throw new InvalidOperationException("Panel rebuild must stop the old update reminder animation.");
+        ToggleExpanded();
+        if (_updateReminder!.HasAnimatedProperties)
+            throw new InvalidOperationException("Collapsing to the compact view must stop the update reminder animation.");
+        ToggleExpanded();
+        _busyActions.Add("upgrade");
+        UpdateBusyVisual("upgrade");
+        if (_updateReminder.HasAnimatedProperties || _actionButtons["upgrade"].Control.IsEnabled)
+            throw new InvalidOperationException("An active update operation must stop the reminder and reject duplicate clicks.");
+        _busyActions.Remove("upgrade");
+        UpdateBusyVisual("upgrade");
+        Hide();
+        if (_updateReminder.HasAnimatedProperties)
+            throw new InvalidOperationException("Hiding the panel must stop the update reminder animation.");
+        _availableUpdate = null;
+        UpdateUpgradeReminder();
         ToggleCreditDetails();
         FitPanelToContent(previewArea);
         var expandedHeight = Height;
@@ -1075,9 +1237,17 @@ internal sealed class GlassWidget : Window
         RebuildPanel();
         FitPanelToContent(previewArea);
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-downloading.png");
+        var downloadBar = (System.Windows.Controls.ProgressBar)_actionButtons["upgrade"].Icon!.Children[1];
+        if (downloadBar.IsIndeterminate || downloadBar.Value != 42 || downloadBar.Visibility != Visibility.Visible ||
+            !_actionButtons["upgrade"].Control.ToolTip.ToString()!.Contains("42%"))
+            throw new InvalidOperationException("Icon-only downloads must retain real progress and a stage tooltip.");
         _busyActions.Clear();
         _upgradeBusyLabel = "检查中…";
         _upgradeProgress = null;
+        UpdateBusyVisual("upgrade");
+        if (downloadBar.IsIndeterminate || downloadBar.Visibility != Visibility.Collapsed ||
+            !_actionButtons["upgrade"].Control.IsEnabled)
+            throw new InvalidOperationException("The icon loading indicator must stop after an operation returns.");
         var confirm = new ConfirmGlass("sample@example.com", 1);
         Save((UIElement)confirm.Content, 420, 285, "preview-glass-confirm.png");
         var previewDirectory = Path.Combine(Path.GetTempPath(), $"CodexLimitShow-preview-{Guid.NewGuid():N}");

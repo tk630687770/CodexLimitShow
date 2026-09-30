@@ -7,4 +7,7 @@
 !/LICENSE
 !/README.md
 !/tools/
+!/Assets/
+/Assets/*
+!/Assets/codex-logo.png
 !/启动 Codex 与用量组件.cmd
