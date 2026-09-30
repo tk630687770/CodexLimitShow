@@ -8,6 +8,8 @@ internal static class WpfMain
     [STAThread]
     private static void Main(string[] args)
     {
+        // The WPF surface and WinForms tray must share the same process DPI context.
+        System.Windows.Forms.Application.SetHighDpiMode(System.Windows.Forms.HighDpiMode.PerMonitorV2);
         if (args.Length > 0 && args[0] == "--apply-update")
         {
             try
@@ -33,6 +35,7 @@ internal static class WpfMain
             QuotaParser.SelfTest();
             SnapshotStore.SelfTest();
             RingGeometry.SelfTest();
+            TaskbarQuotaWindow.SelfTest();
             SubscriptionLookup.SelfTest();
             ReleaseUpdater.SelfTest();
             var resetJson = System.Text.Json.JsonSerializer.Serialize(new ResetConsumeParameters("test-key"));
@@ -69,7 +72,29 @@ internal static class WpfMain
             var previewApp = new Application();
             var widget = new GlassWidget(preview: true);
             widget.RenderPreview();
+            TaskbarQuotaWindow.RenderPreview(Environment.CurrentDirectory);
             widget.Close();
+            return;
+        }
+        if (args.Contains("--taskbar-test", StringComparer.OrdinalIgnoreCase))
+        {
+            var testApp = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            var widget = new GlassWidget(preview: true);
+            var started = false;
+            widget.Loaded += async (_, _) =>
+            {
+                if (started) return;
+                started = true;
+                var exitCode = 0;
+                try { await widget.VerifyTaskbarAsync(); }
+                catch (Exception ex)
+                {
+                    File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "taskbar-test.txt"), ex.ToString());
+                    exitCode = 1;
+                }
+                finally { widget.Close(); testApp.Shutdown(exitCode); }
+            };
+            Environment.ExitCode = testApp.Run(widget);
             return;
         }
         ReleaseUpdater.CleanupOldDownloads();

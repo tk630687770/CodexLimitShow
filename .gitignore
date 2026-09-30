@@ -2,6 +2,7 @@
 !/.gitignore
 !/AGENTS.md
 !/CodexLimitShow.csproj
+!/app.manifest
 !/*.cs
 /Program.cs
 !/LICENSE

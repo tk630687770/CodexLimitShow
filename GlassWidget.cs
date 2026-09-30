@@ -29,6 +29,7 @@ internal sealed class GlassWidget : Window
     private readonly DispatcherTimer _clickTimer = new() { Interval = TimeSpan.FromMilliseconds(WinForms.SystemInformation.DoubleClickTime) };
     private readonly Drawing.Icon _appIcon = CreateAppIcon();
     private readonly WinForms.NotifyIcon _tray;
+    private readonly TaskbarQuotaWindow _taskbar;
     private readonly HashSet<string> _subscriptionAttempted = [];
     private readonly HashSet<string> _expiryContradictionChecked = [];
     private readonly HashSet<string> _busyActions = [];
@@ -44,6 +45,8 @@ internal sealed class GlassWidget : Window
     private ScrollViewer? _panelScroll;
     private TextBlock? _status;
     private bool _expanded;
+    private bool _taskbarMode;
+    private bool _initialized;
     private bool _creditsExpanded;
     private bool _pinned;
     private bool _refreshing;
@@ -97,6 +100,8 @@ internal sealed class GlassWidget : Window
         _tray.ContextMenuStrip.Items.Add("刷新额度", null, (_, _) => Dispatcher.Invoke(() => _ = RefreshAsync(true)));
         _tray.ContextMenuStrip.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Exit));
         _tray.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
+        _taskbar = new TaskbarQuotaWindow(ShowFromTray, point =>
+            _tray.ContextMenuStrip!.Show(new Drawing.Point((int)Math.Round(point.X), (int)Math.Round(point.Y))));
         _refreshTimer.Tick += (_, _) => _ = RefreshAsync();
         _updateTimer.Tick += (_, _) => { _updateTimer.Stop(); _ = CheckForUpdateAutomaticallyAsync(); };
         IsVisibleChanged += (_, _) => UpdateUpgradeReminder();
@@ -108,6 +113,8 @@ internal sealed class GlassWidget : Window
         };
         Loaded += (_, _) =>
         {
+            if (_initialized) return;
+            _initialized = true;
             var area = WinForms.Screen.PrimaryScreen!.WorkingArea;
             var scale = VisualTreeHelper.GetDpi(this).DpiScaleX;
             Left = area.Right / scale - Width - 26;
@@ -129,6 +136,7 @@ internal sealed class GlassWidget : Window
             _glintTimer.Stop();
             _clickTimer.Stop();
             _history?.Close();
+            _taskbar.Dispose();
             _tray.Visible = false;
             _tray.Dispose();
             _appIcon.Dispose();
@@ -188,8 +196,8 @@ internal sealed class GlassWidget : Window
         if (_refreshing) return;
         _refreshing = true;
         _ring.Refreshing = true;
-        _ring.GlintOpacity = 1;
-        _glintTimer.Start();
+        _ring.GlintOpacity = IsVisible ? 1 : 0;
+        if (IsVisible) _glintTimer.Start();
         try
         {
             var next = await _client.ReadSnapshotAsync(CancellationToken.None, forceAccount);
@@ -210,8 +218,7 @@ internal sealed class GlassWidget : Window
             _ring.InvalidateVisual();
             RebuildPanel();
             _history?.Reload();
-            _tray.Text = next.TightestWindow is null ? "Codex · 无活动窗口" :
-                $"Codex {next.TightestWindowName}剩余 {next.TightestWindow.RemainingPercent}%";
+            UpdateTaskbarData();
 
             if (next.Account is { } account &&
                 (oldAccount != account.StorageKey || !_subscriptionAttempted.Contains(account.StorageKey)))
@@ -228,6 +235,7 @@ internal sealed class GlassWidget : Window
         {
             _ring.IsStale = true;
             _ring.InvalidateVisual();
+            UpdateTaskbarData();
             if (_status is not null) _status.Text = _snapshot is null
                 ? $"读取失败 · {SafeError(ex)}" : $"上次数据 · {SafeError(ex)}";
         }
@@ -235,13 +243,14 @@ internal sealed class GlassWidget : Window
         {
             _refreshing = false;
             _ring.Refreshing = false;
-            for (var frame = 0; frame < 8; frame++)
+            for (var frame = 0; frame < 8 && IsVisible; frame++)
             {
                 await Task.Delay(25);
                 _ring.GlintOpacity = 1 - (frame + 1) / 8.0;
                 _ring.InvalidateVisual();
             }
             _glintTimer.Stop();
+            _ring.GlintOpacity = 0;
             _ring.InvalidateVisual();
         }
     }
@@ -399,13 +408,14 @@ internal sealed class GlassWidget : Window
 
     private void CollapseIfOutside()
     {
-        if (_expanded && !IsActive && !_upgradeBusy && _history?.IsActive != true && ConfirmGlass.OpenCount == 0)
+        if (IsVisible && !_taskbarMode && _expanded && !IsActive && !_upgradeBusy &&
+            _history?.IsActive != true && ConfirmGlass.OpenCount == 0)
             ToggleExpanded();
     }
 
     private void RebuildPanel()
     {
-        if (!_expanded) return;
+        if (!_expanded || _taskbarMode) return;
         _updateReminder?.BeginAnimation(OpacityProperty, null);
         _updateBadge = null;
         var s = _snapshot;
@@ -506,7 +516,9 @@ internal sealed class GlassWidget : Window
         body.Children.Add(_status);
         var actions = new UniformGrid { Columns = 3 };
         actions.Children.Add(Button("历史", ToggleHistory));
-        actions.Children.Add(Button("托盘", () => { _history?.Hide(); Hide(); }));
+        var taskbarButton = Button("托盘", HideToTaskbar);
+        taskbarButton.ToolTip = "隐藏悬浮组件，在任务栏显示额度";
+        actions.Children.Add(taskbarButton);
         actions.Children.Add(Button("退出", Exit));
         actions.Margin = new Thickness(18, 6, 18, 16);
         var layout = new Grid();
@@ -932,7 +944,106 @@ internal sealed class GlassWidget : Window
         _history.Top = Math.Clamp(Top, area.Top + 8, area.Bottom - _history.Height - 8);
     }
 
-    private void ShowFromTray() { Show(); Activate(); }
+    private void UpdateTaskbarData()
+    {
+        var longWindow = _snapshot?.Weekly ?? _snapshot?.OtherWindows.FirstOrDefault(w => w.DurationMinutes is >= 40_320 and <= 44_640);
+        var longLabel = _snapshot?.Weekly is null && longWindow is not null ? "月" : "7d";
+        static string Remaining(RateWindow? window) => window is null ? "—" : $"{window.RemainingPercent:0}%";
+        _tray.Text = $"Codex · 5h {Remaining(_snapshot?.FiveHour)} · {longLabel} {Remaining(longWindow)}" +
+            (_ring.IsStale ? " · 上次数据" : "");
+        _taskbar.Update(_snapshot, _ring.IsStale);
+    }
+
+    private void HideToTaskbar()
+    {
+        if (_taskbarMode || _lifetime.IsCancellationRequested) return;
+        try
+        {
+            if (!_taskbar.Show(_snapshot, _ring.IsStale))
+            {
+                if (_status is not null) _status.Text = "任务栏当前没有可用显示空间，悬浮组件已保留。";
+                return;
+            }
+            _taskbarMode = true;
+            _history?.Hide();
+            _clickTimer.Stop();
+            _glintTimer.Stop();
+            _ring.GlintOpacity = 0;
+            Hide();
+            _tray.Visible = false;
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or ArgumentException)
+        {
+            ShowFromTray();
+            if (_status is not null) _status.Text = "任务栏显示未就绪，悬浮组件已保留。";
+        }
+    }
+
+    private void ShowFromTray()
+    {
+        if (_lifetime.IsCancellationRequested) return;
+        _taskbarMode = false;
+        _taskbar.Hide();
+        _tray.Visible = true;
+        Show();
+        if (_expanded) RebuildPanel();
+        Activate();
+    }
+
+    internal async Task VerifyTaskbarAsync()
+    {
+        static void Check(bool valid, string message)
+        {
+            if (!valid) throw new InvalidOperationException(message);
+        }
+        _snapshot = new QuotaSnapshot(new RateWindow(300, 7, null), new RateWindow(10_080, 60, null),
+            [], 0, [], null, DateTimeOffset.Now);
+        _ring.Snapshot = _snapshot;
+        var reports = new List<string>();
+        foreach (var edge in new[] { DockEdge.None, DockEdge.Left })
+        {
+            _edge = edge;
+            SetRingEdge(edge);
+            Left = edge == DockEdge.None ? 200 : 0;
+            Top = 120;
+            var collapsed = new System.Windows.Point(Left, Top);
+            ToggleExpanded();
+            Activate();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            var panelLocation = new System.Windows.Point(Left, Top);
+            HideToTaskbar();
+            Check(_taskbarMode && !IsVisible && !_tray.Visible,
+                $"Taskbar mode must replace both floating and tray views. {_taskbar.LastFailure}");
+            reports.Add(_taskbar.VerifyNativePlacement());
+            await Task.Delay(4000);
+            var bounds = _taskbar.Bounds;
+            using (var bitmap = new Drawing.Bitmap((int)bounds.Width, (int)bounds.Height))
+            {
+                using var graphics = Drawing.Graphics.FromImage(bitmap);
+                graphics.CopyFromScreen((int)bounds.X, (int)bounds.Y, 0, 0, bitmap.Size);
+                bitmap.Save(Path.Combine(Environment.CurrentDirectory, "taskbar-live.png"), Drawing.Imaging.ImageFormat.Png);
+                var coloredPixels = 0;
+                for (var y = 0; y < bitmap.Height; y++)
+                    for (var x = 0; x < bitmap.Width; x++)
+                    {
+                        var pixel = bitmap.GetPixel(x, y);
+                        if (pixel.G > pixel.R + 35 && pixel.G > pixel.B + 15) coloredPixels++;
+                    }
+                Check(coloredPixels > 10, "Taskbar card must be visibly rendered, not merely a valid native child HWND.");
+            }
+            Check(_expanded && _edge == edge, "Hiding must preserve expanded and docked states.");
+            ShowFromTray();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            Check(IsVisible && _tray.Visible && !_taskbarMode && _taskbar.Handle == IntPtr.Zero && _expanded &&
+                new System.Windows.Point(Left, Top) == panelLocation, "Restoring must preserve panel position and clean up its taskbar child.");
+            ToggleExpanded();
+            Check(_edge == edge && new System.Windows.Point(Left, Top) == collapsed,
+                "Collapsing after restore must return to the original ring or docked view.");
+        }
+        File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "taskbar-test.txt"),
+            "PASS: native child, visible rendering, safe placement, handle recreation, hidden state, panel position, ring and docked restoration. Offline synthetic data only.\n" +
+            string.Join("\n", reports));
+    }
 
     private void SetAvailableRelease(RemoteReleaseCandidate? release)
     {
