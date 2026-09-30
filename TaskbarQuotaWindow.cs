@@ -17,8 +17,11 @@ internal sealed class TaskbarQuotaWindow : IDisposable
 {
     internal const double BarWidth = 180, BarHeight = 30;
     private readonly Action _restore;
+    private readonly Action _showPanel;
     private readonly Action<Point> _contextMenu;
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromSeconds(2) };
+    private readonly DispatcherTimer _clickTimer = new()
+        { Interval = TimeSpan.FromMilliseconds(System.Windows.Forms.SystemInformation.DoubleClickTime) };
     private readonly Border _glass;
     private readonly TextBlock _fiveLabel, _fiveValue, _longLabel, _longValue;
     private readonly System.Windows.Shapes.Ellipse _staleDot;
@@ -26,18 +29,21 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     private IntPtr _parent;
     private Rect _bounds = Rect.Empty;
     private bool _requested, _disposed;
+    private bool _leftPressed;
     private bool _noSafeSpace;
     private int _rebindRetries;
     private double _dpi;
 
     internal IntPtr Handle => _source?.Handle ?? IntPtr.Zero;
     internal Rect Bounds => _bounds;
+    internal double DpiScale => _dpi > 0 ? _dpi : 1;
     internal string LastFailure { get; private set; } = string.Empty;
 
-    public TaskbarQuotaWindow(Action restore, Action<Point> contextMenu)
+    public TaskbarQuotaWindow(Action restore, Action<Point> contextMenu, Action showPanel)
     {
         _restore = restore;
         _contextMenu = contextMenu;
+        _showPanel = showPanel;
         var grid = new Grid { Margin = new Thickness(11, 0, 11, 0) };
         grid.ColumnDefinitions.Add(new ColumnDefinition());
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(17) });
@@ -70,17 +76,54 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         _glass.MouseLeave += (_, _) => _glass.Background = GlassBrush(false);
         _glass.MouseLeftButtonDown += (_, e) =>
         {
-            if (e.ClickCount == 2) { e.Handled = true; _restore(); }
+            e.Handled = true;
+            LeftClickDown(e.ClickCount);
         };
+        _glass.MouseLeftButtonUp += (_, e) => { e.Handled = true; LeftClickUp(); };
+        _glass.MouseRightButtonDown += (_, e) => { e.Handled = true; CancelClick(); };
         _glass.MouseRightButtonUp += (_, e) =>
         {
             e.Handled = true;
-            _contextMenu(_glass.PointToScreen(e.GetPosition(_glass)));
+            RightClick(_glass.PointToScreen(e.GetPosition(_glass)));
         };
-        AutomationProperties.SetName(_glass, "Codex 剩余额度；双击恢复悬浮组件");
+        AutomationProperties.SetName(_glass, "Codex 剩余额度；单击展开详情，双击恢复悬浮组件");
         ToolTipService.SetInitialShowDelay(_glass, 450);
         _timer.Tick += (_, _) => MaintainPlacement();
+        _clickTimer.Tick += (_, _) =>
+        {
+            _clickTimer.Stop();
+            if (_requested && !_disposed) _showPanel();
+        };
         Update(null, false);
+    }
+
+    private void LeftClickDown(int count)
+    {
+        if (!_requested || _disposed) return;
+        _leftPressed = count == 1;
+        if (count < 2) return;
+        CancelClick();
+        _restore();
+    }
+
+    private void LeftClickUp()
+    {
+        if (!_leftPressed || !_requested || _disposed) return;
+        _leftPressed = false;
+        _clickTimer.Stop();
+        _clickTimer.Start();
+    }
+
+    private void RightClick(Point point)
+    {
+        CancelClick();
+        if (_requested && !_disposed) _contextMenu(point);
+    }
+
+    private void CancelClick()
+    {
+        _clickTimer.Stop();
+        _leftPressed = false;
     }
 
     public bool Show(QuotaSnapshot? snapshot, bool stale)
@@ -102,7 +145,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         _staleDot.Visibility = stale ? Visibility.Visible : Visibility.Collapsed;
         var status = stale ? snapshot is null ? "读取失败 · 暂无数据" : "上次数据 · 本次刷新失败" :
             snapshot is null ? "正在等待额度数据" : $"更新于 {snapshot.FetchedAt:HH:mm:ss}";
-        var tooltip = $"5 小时剩余 {Percent(snapshot?.FiveHour)} · {_longLabel.Text} 剩余 {Percent(longWindow)}\n{status}\n双击恢复悬浮组件 · 右键打开菜单";
+        var tooltip = $"5 小时剩余 {Percent(snapshot?.FiveHour)} · {_longLabel.Text} 剩余 {Percent(longWindow)}\n{status}\n单击展开详情 · 双击恢复悬浮组件 · 右键打开菜单";
         _glass.ToolTip = tooltip;
         AutomationProperties.SetHelpText(_glass, tooltip);
     }
@@ -223,6 +266,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
 
     private void DropSource()
     {
+        CancelClick();
         if (_source is not null)
         {
             if (!_source.IsDisposed)
@@ -340,10 +384,50 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         Check(maximumText.Width < (BarWidth - 22 - 17) / 2);
     }
 
+    internal static async Task VerifyClicksAsync()
+    {
+        var single = 0;
+        var restore = 0;
+        var menu = 0;
+        using var card = new TaskbarQuotaWindow(() => restore++, _ => menu++, () => single++);
+        card._requested = true;
+        static void Check(bool valid) { if (!valid) throw new InvalidOperationException("Taskbar click routing verification failed."); }
+        async Task WaitForClick() => await Task.Delay(card._clickTimer.Interval + TimeSpan.FromMilliseconds(100));
+        void Click() { card.LeftClickDown(1); card.LeftClickUp(); }
+
+        Click();
+        await WaitForClick();
+        Check(single == 1 && restore == 0 && menu == 0 && card._requested);
+        await WaitForClick();
+        Check(single == 1);
+        Click();
+        card.LeftClickDown(2);
+        card.LeftClickUp();
+        await WaitForClick();
+        Check(single == 1 && restore == 1);
+        Click();
+        card.RightClick(new Point());
+        await WaitForClick();
+        Check(single == 1 && restore == 1 && menu == 1);
+        Click();
+        card.DropSource();
+        await WaitForClick();
+        Check(single == 1);
+        Click();
+        card.Hide();
+        await WaitForClick();
+        Check(single == 1 && !card._requested);
+        card._requested = true;
+        Click();
+        card.Dispose();
+        await WaitForClick();
+        Check(single == 1 && card._disposed);
+    }
+
     internal static void RenderPreview(string directory)
     {
         Directory.CreateDirectory(directory);
-        using var preview = new TaskbarQuotaWindow(() => { }, _ => { });
+        using var preview = new TaskbarQuotaWindow(() => { }, _ => { }, () => { });
         var sample = new QuotaSnapshot(new RateWindow(300, 7, null), new RateWindow(10_080, 60, null), [], null, [], null,
             new DateTimeOffset(2026, 9, 30, 15, 32, 0, TimeSpan.FromHours(8)));
         foreach (var state in new[] { "normal", "full", "empty", "stale", "low", "monthly" })

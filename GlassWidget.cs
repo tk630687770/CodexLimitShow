@@ -46,6 +46,7 @@ internal sealed class GlassWidget : Window
     private TextBlock? _status;
     private bool _expanded;
     private bool _taskbarMode;
+    private (bool Expanded, System.Windows.Point Position, DpiScale Dpi)? _taskbarPanelReturn;
     private bool _initialized;
     private bool _creditsExpanded;
     private bool _pinned;
@@ -101,7 +102,7 @@ internal sealed class GlassWidget : Window
         _tray.ContextMenuStrip.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Exit));
         _tray.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
         _taskbar = new TaskbarQuotaWindow(ShowFromTray, point =>
-            _tray.ContextMenuStrip!.Show(new Drawing.Point((int)Math.Round(point.X), (int)Math.Round(point.Y))));
+            _tray.ContextMenuStrip!.Show(new Drawing.Point((int)Math.Round(point.X), (int)Math.Round(point.Y))), ShowTaskbarPanel);
         _refreshTimer.Tick += (_, _) => _ = RefreshAsync();
         _updateTimer.Tick += (_, _) => { _updateTimer.Stop(); _ = CheckForUpdateAutomaticallyAsync(); };
         IsVisibleChanged += (_, _) => UpdateUpgradeReminder();
@@ -383,6 +384,7 @@ internal sealed class GlassWidget : Window
 
     private void ToggleExpanded()
     {
+        if (_taskbarPanelReturn is not null) { DismissTaskbarPanel(); return; }
         if (_expanded)
         {
             _history?.Hide();
@@ -408,14 +410,17 @@ internal sealed class GlassWidget : Window
 
     private void CollapseIfOutside()
     {
-        if (IsVisible && !_taskbarMode && _expanded && !IsActive && !_upgradeBusy &&
+        if (IsVisible && _expanded && !IsActive && !_upgradeBusy &&
             _history?.IsActive != true && ConfirmGlass.OpenCount == 0)
-            ToggleExpanded();
+        {
+            if (_taskbarPanelReturn is not null) DismissTaskbarPanel();
+            else if (!_taskbarMode) ToggleExpanded();
+        }
     }
 
     private void RebuildPanel()
     {
-        if (!_expanded || _taskbarMode) return;
+        if (!_expanded || (_taskbarMode && _taskbarPanelReturn is null)) return;
         _updateReminder?.BeginAnimation(OpacityProperty, null);
         _updateBadge = null;
         var s = _snapshot;
@@ -426,7 +431,8 @@ internal sealed class GlassWidget : Window
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var collapse = IconButton(_edge == DockEdge.None ? "收起为双圈" : "收起为停靠条",
+        var collapse = IconButton(_taskbarPanelReturn is not null ? "收起到任务栏" :
+            _edge == DockEdge.None ? "收起为双圈" : "收起为停靠条",
             Symbol("\uE73F"), ToggleExpanded);
         top.Children.Add(collapse);
         var title = Text("CODEX  /  LIMITS", 11, C("#92A5AE"), FontWeights.SemiBold);
@@ -548,6 +554,17 @@ internal sealed class GlassWidget : Window
 
     private Rect PanelWorkArea()
     {
+        if (_taskbarPanelReturn is not null && !_taskbar.Bounds.IsEmpty)
+        {
+            var bar = _taskbar.Bounds;
+            var screen = WinForms.Screen.FromRectangle(new Drawing.Rectangle((int)bar.X, (int)bar.Y, (int)bar.Width, (int)bar.Height));
+            var available = screen.WorkingArea;
+            var atTop = bar.Top + bar.Height / 2 < screen.Bounds.Top + screen.Bounds.Height / 2;
+            var top = atTop ? Math.Max(available.Top, bar.Bottom) : available.Top;
+            var bottom = atTop ? available.Bottom : Math.Min(available.Bottom, bar.Top);
+            var scale = _taskbar.DpiScale;
+            return new Rect(available.Left / scale, top / scale, available.Width / scale, (bottom - top) / scale);
+        }
         var area = WinForms.Screen.FromHandle(new Interop.WindowInteropHelper(this).Handle).WorkingArea;
         var dpi = VisualTreeHelper.GetDpi(this);
         return new Rect(area.Left / dpi.DpiScaleX, area.Top / dpi.DpiScaleY,
@@ -956,6 +973,7 @@ internal sealed class GlassWidget : Window
 
     private void HideToTaskbar()
     {
+        if (_taskbarPanelReturn is not null) { DismissTaskbarPanel(); return; }
         if (_taskbarMode || _lifetime.IsCancellationRequested) return;
         try
         {
@@ -982,6 +1000,7 @@ internal sealed class GlassWidget : Window
     private void ShowFromTray()
     {
         if (_lifetime.IsCancellationRequested) return;
+        DismissTaskbarPanel();
         _taskbarMode = false;
         _taskbar.Hide();
         _tray.Visible = true;
@@ -990,8 +1009,46 @@ internal sealed class GlassWidget : Window
         Activate();
     }
 
+    private void ShowTaskbarPanel()
+    {
+        if (!_taskbarMode || _lifetime.IsCancellationRequested || _taskbar.Bounds.IsEmpty) return;
+        if (_taskbarPanelReturn is not null) { Activate(); return; }
+        _taskbarPanelReturn = (_expanded, PointToScreen(new System.Windows.Point(0, 0)), VisualTreeHelper.GetDpi(this));
+        _expanded = true;
+        Width = 400;
+        RebuildPanel();
+        var area = PanelWorkArea();
+        var bar = _taskbar.Bounds;
+        var scale = _taskbar.DpiScale;
+        var x = Math.Clamp((bar.Left + bar.Width / 2) / scale - Width / 2,
+            area.Left + 8, Math.Max(area.Left + 8, area.Right - Width - 8));
+        var screen = WinForms.Screen.FromRectangle(new Drawing.Rectangle((int)bar.X, (int)bar.Y, (int)bar.Width, (int)bar.Height));
+        var atTop = bar.Top + bar.Height / 2 < screen.Bounds.Top + screen.Bounds.Height / 2;
+        var y = atTop ? area.Top + 8 : area.Bottom - Height - 8;
+        SetWindowPos(new Interop.WindowInteropHelper(this).Handle, IntPtr.Zero,
+            (int)Math.Round(x * scale), (int)Math.Round(y * scale),
+            (int)Math.Ceiling(Width * scale), (int)Math.Ceiling(Height * scale), 0x14);
+        Show();
+        Activate();
+    }
+
+    private void DismissTaskbarPanel()
+    {
+        if (_taskbarPanelReturn is not { } saved) return;
+        _history?.Hide();
+        Hide();
+        _taskbarPanelReturn = null;
+        _expanded = saved.Expanded;
+        if (!_expanded) { Content = _ring; SetRingEdge(_edge); }
+        SetWindowPos(new Interop.WindowInteropHelper(this).Handle, IntPtr.Zero,
+            (int)Math.Round(saved.Position.X), (int)Math.Round(saved.Position.Y),
+            (int)Math.Ceiling(Width * saved.Dpi.DpiScaleX), (int)Math.Ceiling(Height * saved.Dpi.DpiScaleY), 0x14);
+        UpdateUpgradeReminder();
+    }
+
     internal async Task VerifyTaskbarAsync()
     {
+        await TaskbarQuotaWindow.VerifyClicksAsync();
         static void Check(bool valid, string message)
         {
             if (!valid) throw new InvalidOperationException(message);
@@ -1032,6 +1089,48 @@ internal sealed class GlassWidget : Window
                 Check(coloredPixels > 10, "Taskbar card must be visibly rendered, not merely a valid native child HWND.");
             }
             Check(_expanded && _edge == edge, "Hiding must preserve expanded and docked states.");
+            var taskbarHandle = _taskbar.Handle;
+            ShowTaskbarPanel();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            Check(IsVisible && _expanded && _taskbarMode && _taskbarPanelReturn is not null &&
+                !_tray.Visible && _taskbar.Handle == taskbarHandle,
+                "Single-click details must keep the existing taskbar card visible.");
+            var panelBottom = PointToScreen(new System.Windows.Point(0, Height));
+            Check(panelBottom.Y <= bounds.Top, "Taskbar details must not cover the quota card.");
+            var previousPanel = _panel;
+            RebuildPanel();
+            Check(!ReferenceEquals(previousPanel, _panel) && _taskbar.Handle == taskbarHandle,
+                "Quota updates must rebuild visible taskbar details without removing the card.");
+            _history = new HistoryGlass(new SnapshotStore(Path.Combine(Path.GetTempPath(), $"CodexLimitShow-empty-history-{Guid.NewGuid():N}.json")))
+                { Owner = this };
+            PositionHistory();
+            _history.Show(); _history.Activate();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            CollapseIfOutside();
+            Check(IsVisible && _taskbarPanelReturn is not null, "History focus must not dismiss taskbar details.");
+            _history.Close(); _history = null;
+            Activate();
+            var confirm = new ConfirmGlass("demo@example.com", 1) { Owner = this };
+            confirm.Show();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            CollapseIfOutside();
+            Check(IsVisible && _taskbarPanelReturn is not null, "Confirmation focus must not dismiss taskbar details.");
+            confirm.Close(); Activate();
+            HideToTaskbar();
+            Check(!IsVisible && _taskbarMode && _taskbarPanelReturn is null && _taskbar.Handle == taskbarHandle,
+                "The tray button must dismiss only the temporary panel.");
+            ShowTaskbarPanel(); ToggleExpanded();
+            Check(!IsVisible && _taskbar.Handle == taskbarHandle, "The collapse button must retain the quota card.");
+            ShowTaskbarPanel();
+            var focusTarget = new Window { Width = 1, Height = 1, WindowStyle = WindowStyle.None,
+                ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false, Left = 0, Top = 0 };
+            focusTarget.Show(); focusTarget.Activate();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            CollapseIfOutside();
+            Check(!IsVisible && _taskbarPanelReturn is null && _taskbar.Handle == taskbarHandle,
+                "External focus must dismiss details without removing the quota card.");
+            focusTarget.Close();
+            ShowTaskbarPanel();
             ShowFromTray();
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
             Check(IsVisible && _tray.Visible && !_taskbarMode && _taskbar.Handle == IntPtr.Zero && _expanded &&
@@ -1039,9 +1138,15 @@ internal sealed class GlassWidget : Window
             ToggleExpanded();
             Check(_edge == edge && new System.Windows.Point(Left, Top) == collapsed,
                 "Collapsing after restore must return to the original ring or docked view.");
+            HideToTaskbar();
+            ShowTaskbarPanel();
+            ShowFromTray();
+            Check(!_expanded && _edge == edge && IsVisible && ReferenceEquals(Content, _ring) &&
+                new System.Windows.Point(Left, Top) == collapsed,
+                "A peek must not turn a previously collapsed component into a permanently expanded one.");
         }
         File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "taskbar-test.txt"),
-            "PASS: native child, visible rendering, safe placement, handle recreation, hidden state, panel position, ring and docked restoration. Offline synthetic data only.\n" +
+            "PASS: click routing, details with card retained, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
             string.Join("\n", reports));
     }
 
