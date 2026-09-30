@@ -439,7 +439,7 @@ internal sealed class GlassWidget : Window
                 Stretch = Stretch.Uniform, HorizontalAlignment = HA.Center, VerticalAlignment = VerticalAlignment.Center },
             OpenCodexAsync);
         Grid.SetColumn(openCodex, 2); top.Children.Add(openCodex);
-        _updateReminder = Symbol("\uE777");
+        _updateReminder = Symbol("\uE898");
         var upgrade = BusyIconButton("upgrade", "检查升级", "检查中…", _updateReminder, UpgradeAsync);
         _updateBadge = new System.Windows.Shapes.Ellipse { Width = 4, Height = 4, Fill = new SolidColorBrush(C("#70E9B0")),
             HorizontalAlignment = HA.Right, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false };
