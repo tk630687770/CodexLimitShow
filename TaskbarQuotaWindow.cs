@@ -145,7 +145,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         _staleDot.Visibility = stale ? Visibility.Visible : Visibility.Collapsed;
         var status = stale ? snapshot is null ? "读取失败 · 暂无数据" : "上次数据 · 本次刷新失败" :
             snapshot is null ? "正在等待额度数据" : $"更新于 {snapshot.FetchedAt:HH:mm:ss}";
-        var tooltip = $"5 小时剩余 {Percent(snapshot?.FiveHour)} · {_longLabel.Text} 剩余 {Percent(longWindow)}\n{status}\n单击展开详情 · 双击恢复悬浮组件 · 右键打开菜单";
+        var tooltip = $"{QuotaTipLine("5 小时", snapshot?.FiveHour)}\n{QuotaTipLine(_longLabel.Text, longWindow)}\n{status}\n单击展开详情 · 双击恢复悬浮组件 · 右键打开菜单";
         _glass.ToolTip = tooltip;
         AutomationProperties.SetHelpText(_glass, tooltip);
     }
@@ -345,6 +345,11 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     private static RateWindow? LongWindow(QuotaSnapshot? snapshot) => snapshot?.Weekly ??
         snapshot?.OtherWindows.FirstOrDefault(w => w.DurationMinutes is >= 40_320 and <= 44_640);
     private static string Percent(RateWindow? window) => window is null ? "—" : $"{window.RemainingPercent}%";
+    private static string QuotaTipLine(string label, RateWindow? window)
+    {
+        var reset = window?.ResetsAt is { } date ? $"{date.ToLocalTime():MM-dd HH:mm} 重置" : "重置时间未知";
+        return $"{label}剩余 {Percent(window)} · {reset}";
+    }
     private static void UpdateValue(TextBlock text, RateWindow? window)
     {
         text.Text = Percent(window);
@@ -379,6 +384,22 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         var snapshot = new QuotaSnapshot(null, null, [new RateWindow(43_200, 38, null)], null, [], null, DateTimeOffset.Now);
         Check(LongWindow(snapshot)?.RemainingPercent == 62);
         Check(LongWindow(snapshot with { Weekly = new RateWindow(10_080, 60, null) })?.RemainingPercent == 40);
+        var resetAt = new DateTimeOffset(2026, 10, 1, 18, 30, 0, TimeSpan.Zero);
+        Check(QuotaTipLine("5 小时", new RateWindow(300, 22, resetAt)) ==
+            $"5 小时剩余 78% · {resetAt.ToLocalTime():MM-dd HH:mm} 重置");
+        Check(QuotaTipLine("7d", null) == "7d剩余 — · 重置时间未知");
+        using var card = new TaskbarQuotaWindow(() => { }, _ => { }, () => { });
+        card.Update(snapshot with { FiveHour = new RateWindow(300, 22, resetAt), Weekly = new RateWindow(10_080, 74, resetAt.AddDays(6)) }, false);
+        var lines = ((string)card._glass.ToolTip).Split('\n');
+        Check(lines[0] == QuotaTipLine("5 小时", new RateWindow(300, 22, resetAt)) &&
+            lines[1] == QuotaTipLine("7d", new RateWindow(10_080, 74, resetAt.AddDays(6))) && lines[2].StartsWith("更新于 "));
+        Check(AutomationProperties.GetHelpText(card._glass) == card._glass.ToolTip.ToString());
+        card.Update(snapshot, true);
+        lines = ((string)card._glass.ToolTip).Split('\n');
+        Check(lines[0] == "5 小时剩余 — · 重置时间未知" && lines[1] == "月剩余 62% · 重置时间未知" &&
+            lines[2] == "上次数据 · 本次刷新失败");
+        card.Update(null, false);
+        Check(((string)card._glass.ToolTip).Split('\n')[2] == "正在等待额度数据");
         var maximumText = new FormattedText("5h 100%", CultureInfo.InvariantCulture, FD.LeftToRight,
             new Typeface("Segoe UI"), 14, Brushes.White, 1);
         Check(maximumText.Width < (BarWidth - 22 - 17) / 2);
