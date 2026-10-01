@@ -219,6 +219,10 @@ internal sealed class TaskbarQuotaWindow : IDisposable
             }
             // A failed/empty accessibility tree is not permission to cover unknown shell controls.
             if (occupied.Count == 0) return false;
+            for (var sibling = FindWindowEx(parent, IntPtr.Zero, null, "Codex taskbar quota"); sibling != IntPtr.Zero;
+                 sibling = FindWindowEx(parent, sibling, null, "Codex taskbar quota"))
+                if (sibling != Handle && IsWindowVisible(sibling) && GetWindowRect(sibling, out var siblingRect))
+                    occupied.Add(siblingRect.ToRect());
             position = FindPosition(barRect.ToRect(), trayRect.ToRect(), occupied,
                 (int)Math.Ceiling(BarWidth * dpi), (int)Math.Ceiling(BarHeight * dpi), (int)Math.Ceiling(6 * dpi));
         }
@@ -374,6 +378,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         var tray = new Rect(1350, 1032, 570, 48);
         var placement = FindPosition(bar, tray, [new Rect(0, 1032, 543, 48)], 180, 30, 6);
         Check(placement is { X: 1164, Y: 1041, Width: 180, Height: 30 });
+        Check(FindPosition(bar, tray, [new Rect(0, 1032, 543, 48), placement!.Value], 180, 30, 6) is { X: 978 });
         Check(FindPosition(bar, tray, [new Rect(0, 1032, 1350, 48)], 180, 30, 6) is null);
         Check(FindPosition(new Rect(0, 0, 48, 1080), new Rect(0, 900, 48, 180), [], 180, 30, 6) is null);
         var scaled = FindPosition(new Rect(0, 1550, 2880, 72), new Rect(2025, 1550, 855, 72),
@@ -485,7 +490,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     }
     [StructLayout(LayoutKind.Sequential)] private struct NativePoint { public int X, Y; }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindow(string className, string? windowName);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string? windowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string? className, string? windowName);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
