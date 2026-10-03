@@ -94,9 +94,19 @@ internal sealed class GlassWidget : Window
             Text = "Codex 用量",
             Icon = _appIcon,
             Visible = true,
-            ContextMenuStrip = new WinForms.ContextMenuStrip()
+            ContextMenuStrip = new WinForms.ContextMenuStrip { Renderer = new MouseShortcutMenuRenderer() }
         };
-        _tray.ContextMenuStrip.Items.Add("显示", null, (_, _) => Dispatcher.Invoke(ShowFromTray));
+        var details = new WinForms.ToolStripMenuItem("展开详情", null, (_, _) => Dispatcher.Invoke(ShowTaskbarPanel))
+            { ShortcutKeyDisplayString = "单击" };
+        var restore = new WinForms.ToolStripMenuItem("恢复悬浮组件", null, (_, _) => Dispatcher.Invoke(ShowFromTray))
+            { ShortcutKeyDisplayString = "双击" };
+        var shortcutSeparator = new WinForms.ToolStripSeparator();
+        _tray.ContextMenuStrip.Items.AddRange([details, restore, shortcutSeparator]);
+        _tray.ContextMenuStrip.Opening += (_, _) =>
+        {
+            details.Visible = shortcutSeparator.Visible = _taskbarMode;
+            restore.ShortcutKeyDisplayString = _taskbarMode ? "双击" : string.Empty;
+        };
         _tray.ContextMenuStrip.Items.Add("打开 Codex", null, (_, _) => Dispatcher.Invoke(() => _ = OpenCodexAsync()));
         _tray.ContextMenuStrip.Items.Add("刷新额度", null, (_, _) => Dispatcher.Invoke(() => _ = RefreshAsync(true)));
         _tray.ContextMenuStrip.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Exit));
@@ -143,6 +153,25 @@ internal sealed class GlassWidget : Window
             _appIcon.Dispose();
             _client.Dispose();
         };
+    }
+
+    private sealed class MouseShortcutMenuRenderer : WinForms.ToolStripProfessionalRenderer
+    {
+        protected override void OnRenderItemText(WinForms.ToolStripItemTextRenderEventArgs e)
+        {
+            if (e.Item is not WinForms.ToolStripMenuItem item ||
+                item.ShortcutKeyDisplayString is not ("单击" or "双击") || e.Text != item.ShortcutKeyDisplayString)
+            {
+                base.OnRenderItemText(e);
+                return;
+            }
+            var original = e.TextFont ?? item.Font;
+            using var hintFont = new Drawing.Font(original.FontFamily, Math.Max(8f, original.SizeInPoints - 1f),
+                original.Style, Drawing.GraphicsUnit.Point);
+            e.TextFont = hintFont;
+            base.OnRenderItemText(e);
+            e.TextFont = original;
+        }
     }
 
     private void HideFromAltTab()
@@ -272,6 +301,7 @@ internal sealed class GlassWidget : Window
                     { SubscriptionExpiresAt = local, SubscriptionCheckedAt = null } };
                 _store.Save(_snapshot);
                 RebuildPanel();
+                UpdateTaskbarData();
             }
             var expiry = await _subscriptions.ReadExpiryAsync(account, CancellationToken.None);
             if (_snapshot?.Account?.StorageKey != expectedKey) return;
@@ -296,6 +326,7 @@ internal sealed class GlassWidget : Window
                 : SafeError(ex);
         }
         RebuildPanel();
+        UpdateTaskbarData();
     }
 
     private void RingDown(object sender, MouseButtonEventArgs e)
@@ -1057,6 +1088,17 @@ internal sealed class GlassWidget : Window
             [], 0, [], null, DateTimeOffset.Now);
         _ring.Snapshot = _snapshot;
         var reports = new List<string>();
+        var menu = _tray.ContextMenuStrip!;
+        var details = (WinForms.ToolStripMenuItem)menu.Items[0];
+        var restore = (WinForms.ToolStripMenuItem)menu.Items[1];
+        Check(menu.Items.OfType<WinForms.ToolStripMenuItem>().All(item =>
+            item.Text != "鼠标快捷操作" && item.ShortcutKeyDisplayString != "右键"),
+            "The menu must not include a redundant right-click hint or mouse-shortcut heading.");
+        menu.Show(new Drawing.Point(8, 8));
+        Check(!details.Available && !menu.Items[2].Available &&
+            string.IsNullOrEmpty(restore.ShortcutKeyDisplayString),
+            "The ordinary notification icon menu must not advertise card-only mouse shortcuts.");
+        menu.Close();
         foreach (var edge in new[] { DockEdge.None, DockEdge.Left })
         {
             _edge = edge;
@@ -1090,11 +1132,22 @@ internal sealed class GlassWidget : Window
             }
             Check(_expanded && _edge == edge, "Hiding must preserve expanded and docked states.");
             var taskbarHandle = _taskbar.Handle;
-            ShowTaskbarPanel();
+            menu.Show(new Drawing.Point((int)bounds.Right, (int)bounds.Top));
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            Check(details.Available && menu.Items[2].Available && details.ShortcutKeyDisplayString == "单击" &&
+                restore.ShortcutKeyDisplayString == "双击",
+                "Taskbar mode must expose correctly labelled mouse shortcuts in its existing menu.");
+            using (var bitmap = new Drawing.Bitmap(menu.Width, menu.Height))
+            {
+                menu.DrawToBitmap(bitmap, new Drawing.Rectangle(Drawing.Point.Empty, bitmap.Size));
+                bitmap.Save(Path.Combine(Environment.CurrentDirectory, "taskbar-menu.png"), Drawing.Imaging.ImageFormat.Png);
+            }
+            menu.Close();
+            details.PerformClick();
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
             Check(IsVisible && _expanded && _taskbarMode && _taskbarPanelReturn is not null &&
                 !_tray.Visible && _taskbar.Handle == taskbarHandle,
-                "Single-click details must keep the existing taskbar card visible.");
+                "Both the details menu action and a card single-click must keep the existing card visible.");
             var panelBottom = PointToScreen(new System.Windows.Point(0, Height));
             Check(panelBottom.Y <= bounds.Top, "Taskbar details must not cover the quota card.");
             var previousPanel = _panel;
@@ -1131,7 +1184,7 @@ internal sealed class GlassWidget : Window
                 "External focus must dismiss details without removing the quota card.");
             focusTarget.Close();
             ShowTaskbarPanel();
-            ShowFromTray();
+            restore.PerformClick();
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
             Check(IsVisible && _tray.Visible && !_taskbarMode && _taskbar.Handle == IntPtr.Zero && _expanded &&
                 new System.Windows.Point(Left, Top) == panelLocation, "Restoring must preserve panel position and clean up its taskbar child.");
@@ -1146,7 +1199,7 @@ internal sealed class GlassWidget : Window
                 "A peek must not turn a previously collapsed component into a permanently expanded one.");
         }
         File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "taskbar-test.txt"),
-            "PASS: click routing, details with card retained, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
+            "PASS: click routing, mouse menu shortcuts and routes, details with card retained, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
             string.Join("\n", reports));
     }
 
@@ -1322,8 +1375,8 @@ internal sealed class GlassWidget : Window
     }
     private void Exit() => Close();
 
-    private static string ExpiryText(QuotaSnapshot? s) => s?.Account?.SubscriptionExpiresAt is { } date
-        ? $"{date:yyyy-MM-dd HH:mm}  {(date < DateTimeOffset.Now ? "待核验" : s.Account.SubscriptionCheckedAt is { } checkedAt ? $"核验 {checkedAt:MM-dd}" : "本地记录·待核验")}" : "未核验";
+    internal static string ExpiryText(QuotaSnapshot? s) => s?.Account?.SubscriptionExpiresAt is { } date
+        ? $"{date.ToLocalTime():yyyy-MM-dd HH:mm}  {(date < DateTimeOffset.Now ? "待核验" : s.Account.SubscriptionCheckedAt is { } checkedAt ? $"核验 {checkedAt.ToLocalTime():MM-dd}" : "本地记录·待核验")}" : "未核验";
     private static string PlanText(QuotaSnapshot? s) => (s?.RateLimitPlanType ?? s?.Account?.PlanType ?? "未知套餐").ToUpperInvariant();
     private static string ResetText(DateTimeOffset? date)
     {

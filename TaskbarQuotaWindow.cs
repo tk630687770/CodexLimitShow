@@ -145,7 +145,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         _staleDot.Visibility = stale ? Visibility.Visible : Visibility.Collapsed;
         var status = stale ? snapshot is null ? "读取失败 · 暂无数据" : "上次数据 · 本次刷新失败" :
             snapshot is null ? "正在等待额度数据" : $"更新于 {snapshot.FetchedAt:HH:mm:ss}";
-        var tooltip = $"{QuotaTipLine("5 小时", snapshot?.FiveHour)}\n{QuotaTipLine(_longLabel.Text, longWindow)}\n{status}\n单击展开详情 · 双击恢复悬浮组件 · 右键打开菜单";
+        var tooltip = $"{QuotaTipLine("5h", snapshot?.FiveHour)}\n{QuotaTipLine(_longLabel.Text, longWindow)}\n订阅到期 {GlassWidget.ExpiryText(snapshot)}\n{status}";
         _glass.ToolTip = tooltip;
         AutomationProperties.SetHelpText(_glass, tooltip);
     }
@@ -390,21 +390,34 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         Check(LongWindow(snapshot)?.RemainingPercent == 62);
         Check(LongWindow(snapshot with { Weekly = new RateWindow(10_080, 60, null) })?.RemainingPercent == 40);
         var resetAt = new DateTimeOffset(2026, 10, 1, 18, 30, 0, TimeSpan.Zero);
-        Check(QuotaTipLine("5 小时", new RateWindow(300, 22, resetAt)) ==
-            $"5 小时剩余 78% · {resetAt.ToLocalTime():MM-dd HH:mm} 重置");
+        Check(QuotaTipLine("5h", new RateWindow(300, 22, resetAt)) ==
+            $"5h剩余 78% · {resetAt.ToLocalTime():MM-dd HH:mm} 重置");
         Check(QuotaTipLine("7d", null) == "7d剩余 — · 重置时间未知");
         using var card = new TaskbarQuotaWindow(() => { }, _ => { }, () => { });
         card.Update(snapshot with { FiveHour = new RateWindow(300, 22, resetAt), Weekly = new RateWindow(10_080, 74, resetAt.AddDays(6)) }, false);
         var lines = ((string)card._glass.ToolTip).Split('\n');
-        Check(lines[0] == QuotaTipLine("5 小时", new RateWindow(300, 22, resetAt)) &&
-            lines[1] == QuotaTipLine("7d", new RateWindow(10_080, 74, resetAt.AddDays(6))) && lines[2].StartsWith("更新于 "));
+        Check(lines.Length == 4 && lines[0] == QuotaTipLine("5h", new RateWindow(300, 22, resetAt)) &&
+            lines[1] == QuotaTipLine("7d", new RateWindow(10_080, 74, resetAt.AddDays(6))) &&
+            lines[2] == "订阅到期 未核验" && lines[3].StartsWith("更新于 "));
         Check(AutomationProperties.GetHelpText(card._glass) == card._glass.ToolTip.ToString());
         card.Update(snapshot, true);
         lines = ((string)card._glass.ToolTip).Split('\n');
-        Check(lines[0] == "5 小时剩余 — · 重置时间未知" && lines[1] == "月剩余 62% · 重置时间未知" &&
-            lines[2] == "上次数据 · 本次刷新失败");
+        Check(lines[0] == "5h剩余 — · 重置时间未知" && lines[1] == "月剩余 62% · 重置时间未知" &&
+            lines[3] == "上次数据 · 本次刷新失败");
+        var expiry = DateTimeOffset.UtcNow.AddDays(10);
+        var account = new AccountSummary("test", "demo@example.com", "plus", expiry);
+        card.Update(snapshot with { Account = account }, false);
+        lines = ((string)card._glass.ToolTip).Split('\n');
+        Check(lines[2] == $"订阅到期 {expiry.ToLocalTime():yyyy-MM-dd HH:mm}  本地记录·待核验");
+        var checkedAt = DateTimeOffset.UtcNow;
+        card.Update(snapshot with { Account = account with { SubscriptionCheckedAt = checkedAt } }, false);
+        Check(((string)card._glass.ToolTip).Split('\n')[2] ==
+            $"订阅到期 {expiry.ToLocalTime():yyyy-MM-dd HH:mm}  核验 {checkedAt.ToLocalTime():MM-dd}");
+        var pastExpiry = DateTimeOffset.UtcNow.AddDays(-1);
+        card.Update(snapshot with { Account = account with { SubscriptionExpiresAt = pastExpiry, SubscriptionCheckedAt = checkedAt } }, true);
+        Check(((string)card._glass.ToolTip).Split('\n')[2] == $"订阅到期 {pastExpiry.ToLocalTime():yyyy-MM-dd HH:mm}  待核验");
         card.Update(null, false);
-        Check(((string)card._glass.ToolTip).Split('\n')[2] == "正在等待额度数据");
+        Check(((string)card._glass.ToolTip).Split('\n')[3] == "正在等待额度数据");
         var maximumText = new FormattedText("5h 100%", CultureInfo.InvariantCulture, FD.LeftToRight,
             new Typeface("Segoe UI"), 14, Brushes.White, 1);
         Check(maximumText.Width < (BarWidth - 22 - 17) / 2);
@@ -454,8 +467,9 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     {
         Directory.CreateDirectory(directory);
         using var preview = new TaskbarQuotaWindow(() => { }, _ => { }, () => { });
-        var sample = new QuotaSnapshot(new RateWindow(300, 7, null), new RateWindow(10_080, 60, null), [], null, [], null,
-            new DateTimeOffset(2026, 9, 30, 15, 32, 0, TimeSpan.FromHours(8)));
+        var previewTime = new DateTimeOffset(2026, 10, 3, 12, 6, 55, TimeSpan.FromHours(8));
+        var sample = new QuotaSnapshot(new RateWindow(300, 7, previewTime.AddHours(5)), new RateWindow(10_080, 60, previewTime.AddDays(7)),
+            [], null, [], null, previewTime, new AccountSummary("preview", "demo@example.com", "plus", previewTime.AddDays(10)));
         foreach (var state in new[] { "normal", "full", "empty", "stale", "low", "monthly" })
         {
             var data = state switch
@@ -479,6 +493,19 @@ internal sealed class TaskbarQuotaWindow : IDisposable
                 encoder.Frames.Add(BitmapFrame.Create(bitmap));
                 using var output = File.Create(Path.Combine(directory, $"taskbar-{state}-{scale * 100:0}.png"));
                 encoder.Save(output);
+                if (state == "normal")
+                {
+                    var tooltip = new System.Windows.Controls.ToolTip { Content = preview._glass.ToolTip };
+                    tooltip.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                    tooltip.Arrange(new Rect(new Point(), tooltip.DesiredSize));
+                    var tipBitmap = new RenderTargetBitmap((int)Math.Ceiling(tooltip.ActualWidth * scale),
+                        (int)Math.Ceiling(tooltip.ActualHeight * scale), 96 * scale, 96 * scale, PixelFormats.Pbgra32);
+                    tipBitmap.Render(tooltip);
+                    var tipEncoder = new PngBitmapEncoder();
+                    tipEncoder.Frames.Add(BitmapFrame.Create(tipBitmap));
+                    using var tipOutput = File.Create(Path.Combine(directory, $"taskbar-tooltip-{scale * 100:0}.png"));
+                    tipEncoder.Save(tipOutput);
+                }
             }
         }
     }
