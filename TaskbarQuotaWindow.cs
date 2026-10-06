@@ -23,6 +23,12 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     private readonly DispatcherTimer _clickTimer = new()
         { Interval = TimeSpan.FromMilliseconds(System.Windows.Forms.SystemInformation.DoubleClickTime) };
     private readonly Border _glass;
+    private readonly System.Windows.Controls.ToolTip _tooltip = new()
+    {
+        Background = Brush(Color.FromRgb(44, 44, 44)), Foreground = Brushes.White,
+        BorderBrush = Brush(Color.FromRgb(64, 64, 64)), BorderThickness = new Thickness(1),
+        Padding = new Thickness(10, 7, 10, 7), FontFamily = new FontFamily("Segoe UI"), FontSize = 12
+    };
     private readonly TextBlock _fiveLabel, _fiveValue, _longLabel, _longValue;
     private readonly System.Windows.Shapes.Ellipse _staleDot;
     private HwndSource? _source;
@@ -87,6 +93,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
             RightClick(_glass.PointToScreen(e.GetPosition(_glass)));
         };
         AutomationProperties.SetName(_glass, "Codex 剩余额度；单击展开详情，双击恢复悬浮组件");
+        _glass.ToolTip = _tooltip;
         ToolTipService.SetInitialShowDelay(_glass, 450);
         _timer.Tick += (_, _) => MaintainPlacement();
         _clickTimer.Tick += (_, _) =>
@@ -146,7 +153,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         var status = stale ? snapshot is null ? "读取失败 · 暂无数据" : "上次数据 · 本次刷新失败" :
             snapshot is null ? "正在等待额度数据" : $"更新于 {snapshot.FetchedAt:HH:mm:ss}";
         var tooltip = $"{QuotaTipLine("5h", snapshot?.FiveHour)}\n{QuotaTipLine(_longLabel.Text, longWindow)}\n订阅到期 {GlassWidget.ExpiryText(snapshot)}\n{status}";
-        _glass.ToolTip = tooltip;
+        _tooltip.Content = tooltip;
         AutomationProperties.SetHelpText(_glass, tooltip);
     }
 
@@ -394,30 +401,34 @@ internal sealed class TaskbarQuotaWindow : IDisposable
             $"5h剩余 78% · {resetAt.ToLocalTime():MM-dd HH:mm} 重置");
         Check(QuotaTipLine("7d", null) == "7d剩余 — · 重置时间未知");
         using var card = new TaskbarQuotaWindow(() => { }, _ => { }, () => { });
+        Check(ReferenceEquals(card._glass.ToolTip, card._tooltip) &&
+            card._tooltip.Background is SolidColorBrush { Color: var tipBackground } && tipBackground == Color.FromRgb(44, 44, 44) &&
+            card._tooltip.Foreground is SolidColorBrush { Color: var tipForeground } && tipForeground == Colors.White);
         card.Update(snapshot with { FiveHour = new RateWindow(300, 22, resetAt), Weekly = new RateWindow(10_080, 74, resetAt.AddDays(6)) }, false);
-        var lines = ((string)card._glass.ToolTip).Split('\n');
+        var lines = ((string)card._tooltip.Content).Split('\n');
         Check(lines.Length == 4 && lines[0] == QuotaTipLine("5h", new RateWindow(300, 22, resetAt)) &&
             lines[1] == QuotaTipLine("7d", new RateWindow(10_080, 74, resetAt.AddDays(6))) &&
             lines[2] == "订阅到期 未核验" && lines[3].StartsWith("更新于 "));
-        Check(AutomationProperties.GetHelpText(card._glass) == card._glass.ToolTip.ToString());
+        Check(AutomationProperties.GetHelpText(card._glass) == card._tooltip.Content.ToString());
         card.Update(snapshot, true);
-        lines = ((string)card._glass.ToolTip).Split('\n');
+        Check(ReferenceEquals(card._glass.ToolTip, card._tooltip));
+        lines = ((string)card._tooltip.Content).Split('\n');
         Check(lines[0] == "5h剩余 — · 重置时间未知" && lines[1] == "月剩余 62% · 重置时间未知" &&
             lines[3] == "上次数据 · 本次刷新失败");
         var expiry = DateTimeOffset.UtcNow.AddDays(10);
         var account = new AccountSummary("test", "demo@example.com", "plus", expiry);
         card.Update(snapshot with { Account = account }, false);
-        lines = ((string)card._glass.ToolTip).Split('\n');
+        lines = ((string)card._tooltip.Content).Split('\n');
         Check(lines[2] == $"订阅到期 {expiry.ToLocalTime():yyyy-MM-dd HH:mm}  本地记录·待核验");
         var checkedAt = DateTimeOffset.UtcNow;
         card.Update(snapshot with { Account = account with { SubscriptionCheckedAt = checkedAt } }, false);
-        Check(((string)card._glass.ToolTip).Split('\n')[2] ==
+        Check(((string)card._tooltip.Content).Split('\n')[2] ==
             $"订阅到期 {expiry.ToLocalTime():yyyy-MM-dd HH:mm}  核验 {checkedAt.ToLocalTime():MM-dd}");
         var pastExpiry = DateTimeOffset.UtcNow.AddDays(-1);
         card.Update(snapshot with { Account = account with { SubscriptionExpiresAt = pastExpiry, SubscriptionCheckedAt = checkedAt } }, true);
-        Check(((string)card._glass.ToolTip).Split('\n')[2] == $"订阅到期 {pastExpiry.ToLocalTime():yyyy-MM-dd HH:mm}  待核验");
+        Check(((string)card._tooltip.Content).Split('\n')[2] == $"订阅到期 {pastExpiry.ToLocalTime():yyyy-MM-dd HH:mm}  待核验");
         card.Update(null, false);
-        Check(((string)card._glass.ToolTip).Split('\n')[3] == "正在等待额度数据");
+        Check(((string)card._tooltip.Content).Split('\n')[3] == "正在等待额度数据");
         var maximumText = new FormattedText("5h 100%", CultureInfo.InvariantCulture, FD.LeftToRight,
             new Typeface("Segoe UI"), 14, Brushes.White, 1);
         Check(maximumText.Width < (BarWidth - 22 - 17) / 2);
@@ -495,7 +506,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
                 encoder.Save(output);
                 if (state == "normal")
                 {
-                    var tooltip = new System.Windows.Controls.ToolTip { Content = preview._glass.ToolTip };
+                    var tooltip = preview._tooltip;
                     tooltip.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
                     tooltip.Arrange(new Rect(new Point(), tooltip.DesiredSize));
                     var tipBitmap = new RenderTargetBitmap((int)Math.Ceiling(tooltip.ActualWidth * scale),
