@@ -36,14 +36,13 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     private Rect _bounds = Rect.Empty;
     private bool _requested, _disposed;
     private bool _leftPressed;
-    private bool _noSafeSpace;
-    private int _rebindRetries;
     private double _dpi;
 
     internal IntPtr Handle => _source?.Handle ?? IntPtr.Zero;
     internal Rect Bounds => _bounds;
     internal double DpiScale => _dpi > 0 ? _dpi : 1;
     internal string LastFailure { get; private set; } = string.Empty;
+    internal event Action<bool>? AvailabilityChanged;
 
     public TaskbarQuotaWindow(Action restore, Action<Point> contextMenu, Action showPanel)
     {
@@ -133,14 +132,13 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         _leftPressed = false;
     }
 
-    public bool Show(QuotaSnapshot? snapshot, bool stale)
+    public void Show(QuotaSnapshot? snapshot, bool stale)
     {
-        if (_disposed) return false;
-        Update(snapshot, stale);
+        if (_disposed) return;
         _requested = true;
-        if (!AttachAndPosition()) { Hide(); return false; }
         _timer.Start();
-        return true;
+        Update(snapshot, stale);
+        MaintainPlacement();
     }
 
     public void Update(QuotaSnapshot? snapshot, bool stale)
@@ -160,7 +158,6 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     public void Hide()
     {
         _requested = false;
-        _rebindRetries = 0;
         _timer.Stop();
         DropSource();
     }
@@ -174,17 +171,20 @@ internal sealed class TaskbarQuotaWindow : IDisposable
 
     private void MaintainPlacement()
     {
-        if (!_requested) return;
-        // Explorer restart is transient: preserve the mode until its new taskbar exists.
+        if (!_requested || _disposed) return;
         var parent = FindWindow("Shell_TrayWnd", null);
-        if (parent == IntPtr.Zero) { DropSource(); _rebindRetries = 0; return; }
         if (_source is not null && (_source.IsDisposed || _parent != parent || !IsWindow(_source.Handle))) DropSource();
-        if (AttachAndPosition()) { _rebindRetries = 0; return; }
-        // The new shell HWND may appear before its notification/accessibility tree is ready.
-        // Retry only that transient case, never knowingly cover a full taskbar.
-        if (!_noSafeSpace && _rebindRetries++ < 3) { DropSource(); return; }
-        Hide();
-        _glass.Dispatcher.BeginInvoke(_restore);
+        if (parent == IntPtr.Zero) LastFailure = "任务栏暂不可用";
+        ApplyPlacementResult(parent != IntPtr.Zero && AttachAndPosition());
+    }
+
+    internal void ApplyPlacementResult(bool available)
+    {
+        if (!_requested || _disposed) return;
+        // Keep the user's tray mode; never turn a layout failure into a desktop restore.
+        if (!available) DropSource();
+        _timer.Interval = TimeSpan.FromSeconds(available ? 2 : 10);
+        AvailabilityChanged?.Invoke(available);
     }
 
     private bool AttachAndPosition()
@@ -192,7 +192,6 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         try
         {
             LastFailure = string.Empty;
-            _noSafeSpace = false;
             var attached = AttachAndPositionCore();
             if (!attached && LastFailure.Length == 0) LastFailure = "任务栏空间或嵌入条件不可用";
             return attached;
@@ -235,7 +234,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException or UnauthorizedAccessException)
         { LastFailure = $"{ex.GetType().Name}: {ex.Message}"; return false; }
-        if (position is null) { _noSafeSpace = true; return false; }
+        if (position is null) { LastFailure = "任务栏当前没有安全空位"; return false; }
         if (_source is null || _source.IsDisposed || _parent != parent || !IsWindow(_source.Handle))
         {
             DropSource();
@@ -278,6 +277,7 @@ internal sealed class TaskbarQuotaWindow : IDisposable
     private void DropSource()
     {
         CancelClick();
+        _tooltip.IsOpen = false;
         if (_source is not null)
         {
             if (!_source.IsDisposed)
@@ -432,6 +432,25 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         var maximumText = new FormattedText("5h 100%", CultureInfo.InvariantCulture, FD.LeftToRight,
             new Typeface("Segoe UI"), 14, Brushes.White, 1);
         Check(maximumText.Width < (BarWidth - 22 - 17) / 2);
+        var restores = 0;
+        using var waiting = new TaskbarQuotaWindow(() => restores++, _ => { }, () => { });
+        var availability = new List<bool>();
+        waiting.AvailabilityChanged += availability.Add;
+        waiting._requested = true;
+        waiting._timer.Start();
+        for (var i = 0; i < 6; i++) waiting.ApplyPlacementResult(false);
+        Check(waiting._requested && waiting._timer.IsEnabled && waiting._timer.Interval == TimeSpan.FromSeconds(10) &&
+            waiting.Handle == IntPtr.Zero && availability.Count == 6 && availability.All(value => !value) && restores == 0);
+        waiting.ApplyPlacementResult(true);
+        Check(waiting._requested && waiting._timer.IsEnabled && waiting._timer.Interval == TimeSpan.FromSeconds(2) &&
+            availability.Count == 7 && availability[^1] && restores == 0);
+        waiting.Hide();
+        waiting.MaintainPlacement();
+        waiting.ApplyPlacementResult(true);
+        Check(!waiting._requested && !waiting._timer.IsEnabled && availability.Count == 7 && restores == 0);
+        waiting.Dispose();
+        waiting.ApplyPlacementResult(false);
+        Check(availability.Count == 7);
     }
 
     internal static async Task VerifyClicksAsync()

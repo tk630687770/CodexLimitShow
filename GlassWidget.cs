@@ -104,7 +104,7 @@ internal sealed class GlassWidget : Window
         _tray.ContextMenuStrip.Items.AddRange([details, restore, shortcutSeparator]);
         _tray.ContextMenuStrip.Opening += (_, _) =>
         {
-            details.Visible = shortcutSeparator.Visible = _taskbarMode;
+            details.Visible = shortcutSeparator.Visible = _taskbarMode && _taskbar is not null && !_taskbar.Bounds.IsEmpty;
             restore.ShortcutKeyDisplayString = _taskbarMode ? "双击" : string.Empty;
         };
         _tray.ContextMenuStrip.Items.Add("打开 Codex", null, (_, _) => Dispatcher.Invoke(() => _ = OpenCodexAsync()));
@@ -113,6 +113,10 @@ internal sealed class GlassWidget : Window
         _tray.DoubleClick += (_, _) => Dispatcher.Invoke(ShowFromTray);
         _taskbar = new TaskbarQuotaWindow(ShowFromTray, point =>
             _tray.ContextMenuStrip!.Show(new Drawing.Point((int)Math.Round(point.X), (int)Math.Round(point.Y))), ShowTaskbarPanel);
+        _taskbar.AvailabilityChanged += available =>
+        {
+            if (_taskbarMode && !_lifetime.IsCancellationRequested) _tray.Visible = !available;
+        };
         _refreshTimer.Tick += (_, _) => _ = RefreshAsync();
         _updateTimer.Tick += (_, _) => { _updateTimer.Stop(); _ = CheckForUpdateAutomaticallyAsync(); };
         IsVisibleChanged += (_, _) => UpdateUpgradeReminder();
@@ -1006,25 +1010,21 @@ internal sealed class GlassWidget : Window
     {
         if (_taskbarPanelReturn is not null) { DismissTaskbarPanel(); return; }
         if (_taskbarMode || _lifetime.IsCancellationRequested) return;
+        _taskbarMode = true;
+        _tray.Visible = true;
+        _history?.Hide();
+        _clickTimer.Stop();
+        _glintTimer.Stop();
+        _ring.GlintOpacity = 0;
+        Hide();
         try
         {
-            if (!_taskbar.Show(_snapshot, _ring.IsStale))
-            {
-                if (_status is not null) _status.Text = "任务栏当前没有可用显示空间，悬浮组件已保留。";
-                return;
-            }
-            _taskbarMode = true;
-            _history?.Hide();
-            _clickTimer.Stop();
-            _glintTimer.Stop();
-            _ring.GlintOpacity = 0;
-            Hide();
-            _tray.Visible = false;
+            _taskbar.Show(_snapshot, _ring.IsStale);
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or ArgumentException)
         {
-            ShowFromTray();
-            if (_status is not null) _status.Text = "任务栏显示未就绪，悬浮组件已保留。";
+            _tray.Visible = true;
+            if (_status is not null) _status.Text = "任务栏显示暂不可用，已保留托盘图标并等待恢复。";
         }
     }
 
@@ -1131,6 +1131,19 @@ internal sealed class GlassWidget : Window
                 Check(coloredPixels > 10, "Taskbar card must be visibly rendered, not merely a valid native child HWND.");
             }
             Check(_expanded && _edge == edge, "Hiding must preserve expanded and docked states.");
+            for (var i = 0; i < 6; i++) _taskbar.ApplyPlacementResult(false);
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            Check(_taskbarMode && !IsVisible && _tray.Visible && _taskbar.Handle == IntPtr.Zero && _expanded && _edge == edge,
+                "Repeated layout failures must keep the desktop hidden and expose the fallback notification icon.");
+            menu.Show(new Drawing.Point(8, 8));
+            Check(!details.Available && restore.Available && restore.Enabled,
+                "The fallback icon must retain manual restore without advertising unavailable card details.");
+            menu.Close();
+            _taskbar.Show(_snapshot, false);
+            Check(_taskbarMode && !IsVisible && !_tray.Visible && _taskbar.Handle != IntPtr.Zero,
+                "A recovered safe slot must restore only the quota card, not the desktop component.");
+            reports.Add(_taskbar.VerifyNativePlacement());
+            bounds = _taskbar.Bounds;
             var taskbarHandle = _taskbar.Handle;
             menu.Show(new Drawing.Point((int)bounds.Right, (int)bounds.Top));
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
@@ -1184,6 +1197,9 @@ internal sealed class GlassWidget : Window
                 "External focus must dismiss details without removing the quota card.");
             focusTarget.Close();
             ShowTaskbarPanel();
+            _taskbar.ApplyPlacementResult(false);
+            Check(IsVisible && _taskbarMode && _tray.Visible && _taskbarPanelReturn is not null,
+                "A layout failure must not replace or dismiss details the user explicitly opened.");
             restore.PerformClick();
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
             Check(IsVisible && _tray.Visible && !_taskbarMode && _taskbar.Handle == IntPtr.Zero && _expanded &&
@@ -1197,9 +1213,17 @@ internal sealed class GlassWidget : Window
             Check(!_expanded && _edge == edge && IsVisible && ReferenceEquals(Content, _ring) &&
                 new System.Windows.Point(Left, Top) == collapsed,
                 "A peek must not turn a previously collapsed component into a permanently expanded one.");
+            HideToTaskbar();
+            _taskbar.ApplyPlacementResult(false);
+            restore.PerformClick();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            _taskbar.ApplyPlacementResult(true);
+            Check(!_taskbarMode && IsVisible && _tray.Visible && !_expanded && _edge == edge && _taskbar.Handle == IntPtr.Zero &&
+                new System.Windows.Point(Left, Top) == collapsed,
+                "Manual restore during an outage must preserve the original view and stop automatic recovery.");
         }
         File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "taskbar-test.txt"),
-            "PASS: click routing, mouse menu shortcuts and routes, details with card retained, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
+            "PASS: click routing, mouse menu shortcuts and routes, layout-failure tray fallback without desktop restore, safe card recovery, details with card retained, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
             string.Join("\n", reports));
     }
 
