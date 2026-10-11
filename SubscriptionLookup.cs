@@ -11,6 +11,11 @@ internal sealed class SubscriptionLookup
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
 
+    internal static AccountSummary MergeLocalExpiry(AccountSummary account, DateTimeOffset? localExpiry) =>
+        localExpiry is { } local && (account.SubscriptionExpiresAt is null || local > account.SubscriptionExpiresAt)
+            ? account with { SubscriptionExpiresAt = local, SubscriptionCheckedAt = null }
+            : account;
+
     public DateTimeOffset? ReadLocalExpiry(AccountSummary expected)
     {
         var authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
@@ -186,6 +191,19 @@ internal sealed class SubscriptionLookup
             TryReadTokenClaims(token, "other", "alice@example.com", out _) ||
             TryReadTokenClaims(token, "wanted", "bob@example.com", out _))
             throw new InvalidOperationException("Subscription login claim validation failed.");
+        var beforeRenewal = new AccountSummary("sample", "alice@example.com", "plus",
+            DateTimeOffset.UtcNow.AddDays(7), DateTimeOffset.UtcNow);
+        var renewed = MergeLocalExpiry(beforeRenewal, beforeRenewal.SubscriptionExpiresAt!.Value.AddMonths(1));
+        if (renewed.SubscriptionExpiresAt != beforeRenewal.SubscriptionExpiresAt.Value.AddMonths(1) ||
+            renewed.SubscriptionCheckedAt is not null ||
+            MergeLocalExpiry(renewed, beforeRenewal.SubscriptionExpiresAt) != renewed ||
+            MergeLocalExpiry(beforeRenewal, beforeRenewal.SubscriptionExpiresAt) != beforeRenewal ||
+            MergeLocalExpiry(beforeRenewal, null) != beforeRenewal ||
+            MergeLocalExpiry(beforeRenewal with { SubscriptionExpiresAt = DateTimeOffset.UtcNow.AddDays(-1) },
+                renewed.SubscriptionExpiresAt).SubscriptionExpiresAt != renewed.SubscriptionExpiresAt ||
+            MergeLocalExpiry(beforeRenewal with { SubscriptionExpiresAt = null }, renewed.SubscriptionExpiresAt)
+                .SubscriptionExpiresAt != renewed.SubscriptionExpiresAt)
+            throw new InvalidOperationException("Renewed login claims must advance dates without claiming online verification or regressing them.");
     }
 
     private static DateTimeOffset? ParseDateProperty(JsonElement node, string key)

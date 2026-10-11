@@ -32,6 +32,8 @@ internal sealed class GlassWidget : Window
     private readonly TaskbarQuotaWindow _taskbar;
     private readonly HashSet<string> _subscriptionAttempted = [];
     private readonly HashSet<string> _expiryContradictionChecked = [];
+    private (DateTime LastWriteUtc, long Length)? _subscriptionAuthStamp;
+    private int _subscriptionRequestVersion;
     private readonly HashSet<string> _busyActions = [];
     private readonly Dictionary<string, (Button Control, string Label, string BusyLabel, Grid? Icon)> _actionButtons = [];
     private TextBlock? _updateReminder;
@@ -238,6 +240,7 @@ internal sealed class GlassWidget : Window
             var oldAccount = _snapshot?.Account?.StorageKey;
             if (oldAccount != next.Account?.StorageKey)
             {
+                _subscriptionRequestVersion++;
                 _subscriptionError = null;
                 _creditsExpanded = false;
             }
@@ -245,6 +248,25 @@ internal sealed class GlassWidget : Window
             if (next.Account is not null && saved?.SubscriptionExpiresAt is not null)
                 next = next with { Account = next.Account with { SubscriptionExpiresAt = saved.SubscriptionExpiresAt,
                     SubscriptionCheckedAt = saved.SubscriptionCheckedAt } };
+            var authStamp = CodexAppServerClient.ReadAuthFileStamp();
+            if (next.Account is { } localAccount &&
+                (oldAccount != localAccount.StorageKey || authStamp != _subscriptionAuthStamp || forceAccount))
+            {
+                _subscriptionRequestVersion++;
+                _expiryContradictionChecked.Remove(localAccount.StorageKey);
+                try
+                {
+                    var updated = SubscriptionLookup.MergeLocalExpiry(localAccount, _subscriptions.ReadLocalExpiry(localAccount));
+                    if (updated != localAccount) _subscriptionError = null;
+                    next = next with { Account = updated };
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or
+                                               KeyNotFoundException or InvalidOperationException or CodexClientException)
+                {
+                    // Optional local subscription metadata must never block the quota display.
+                }
+            }
+            _subscriptionAuthStamp = authStamp;
             _snapshot = next;
             _store.Save(next);
             _ring.Snapshot = next;
@@ -261,8 +283,8 @@ internal sealed class GlassWidget : Window
                 _ = VerifySubscriptionAsync(account.StorageKey);
             }
             else if (next.Account is { } current && current.SubscriptionExpiresAt <= DateTimeOffset.Now &&
-                     _expiryContradictionChecked.Add(current.StorageKey) &&
-                     !string.Equals(current.PlanType, "free", StringComparison.OrdinalIgnoreCase))
+                     !string.Equals(next.RateLimitPlanType ?? current.PlanType, "free", StringComparison.OrdinalIgnoreCase) &&
+                     _expiryContradictionChecked.Add(current.StorageKey))
                 _ = VerifySubscriptionAsync(current.StorageKey);
         }
         catch (Exception ex)
@@ -292,23 +314,22 @@ internal sealed class GlassWidget : Window
     private async Task VerifySubscriptionAsync(string expectedKey)
     {
         if (_snapshot?.Account is not { } account || account.StorageKey != expectedKey) return;
+        var requestVersion = ++_subscriptionRequestVersion;
+        var authStamp = CodexAppServerClient.ReadAuthFileStamp();
         try
         {
-            var localExpiry = _subscriptions.ReadLocalExpiry(account);
-            if (localExpiry is { } local && _snapshot?.Account is { } current &&
-                current.StorageKey == expectedKey &&
-                (current.SubscriptionExpiresAt is null ||
-                 (current.SubscriptionCheckedAt is null && current.SubscriptionExpiresAt != local) ||
-                 (current.SubscriptionExpiresAt < DateTimeOffset.Now && local > current.SubscriptionExpiresAt)))
+            var updated = SubscriptionLookup.MergeLocalExpiry(account, _subscriptions.ReadLocalExpiry(account));
+            if (updated != account)
             {
-                _snapshot = _snapshot with { Account = current with
-                    { SubscriptionExpiresAt = local, SubscriptionCheckedAt = null } };
+                _snapshot = _snapshot with { Account = updated };
+                _subscriptionError = null;
                 _store.Save(_snapshot);
+                _history?.Reload();
                 RebuildPanel();
                 UpdateTaskbarData();
             }
-            var expiry = await _subscriptions.ReadExpiryAsync(account, CancellationToken.None);
-            if (_snapshot?.Account?.StorageKey != expectedKey) return;
+            var expiry = await _subscriptions.ReadExpiryAsync(account, _lifetime.Token);
+            if (!IsCurrentSubscriptionRequest(expectedKey, requestVersion, authStamp)) return;
             if (expiry is null)
             {
                 _subscriptionError = "服务端未返回可核对的到期时间";
@@ -323,6 +344,7 @@ internal sealed class GlassWidget : Window
         }
         catch (Exception ex)
         {
+            if (!IsCurrentSubscriptionRequest(expectedKey, requestVersion, authStamp)) return;
             _subscriptionError = ex is CodexClientException { Message: var message } && message.Contains("网页防护拦截", StringComparison.Ordinal)
                 ? _snapshot?.Account?.SubscriptionExpiresAt is null ? "订阅网页防护拦截（403）；暂无可显示日期"
                     : _snapshot.Account.SubscriptionCheckedAt is null ? "联网核验被拦截（403）；显示本地登录记录"
@@ -330,8 +352,13 @@ internal sealed class GlassWidget : Window
                 : SafeError(ex);
         }
         RebuildPanel();
+        _history?.Reload();
         UpdateTaskbarData();
     }
+
+    private bool IsCurrentSubscriptionRequest(string expectedKey, int version, (DateTime LastWriteUtc, long Length)? authStamp) =>
+        !_lifetime.IsCancellationRequested && _snapshot?.Account?.StorageKey == expectedKey &&
+        _subscriptionRequestVersion == version && CodexAppServerClient.ReadAuthFileStamp() == authStamp;
 
     private void RingDown(object sender, MouseButtonEventArgs e)
     {
@@ -1429,6 +1456,16 @@ internal sealed class GlassWidget : Window
              new ResetCredit("Full reset", "available", previewTime, new DateTimeOffset(2026, 10, 30, 2, 49, 0, previewTime.Offset))],
             new UsageStats(null, 4_420_000_000), previewTime,
             new AccountSummary("PREVIEW", "demo@example.com", "plus", new DateTimeOffset(2026, 10, 2, 23, 17, 0, previewTime.Offset)), "plus");
+        var requestVersion = ++_subscriptionRequestVersion;
+        var authStamp = CodexAppServerClient.ReadAuthFileStamp();
+        if (!IsCurrentSubscriptionRequest("PREVIEW", requestVersion, authStamp) ||
+            IsCurrentSubscriptionRequest("OTHER", requestVersion, authStamp) ||
+            IsCurrentSubscriptionRequest("PREVIEW", requestVersion - 1, authStamp) ||
+            IsCurrentSubscriptionRequest("PREVIEW", requestVersion, (DateTime.MinValue, -1)))
+            throw new InvalidOperationException("Subscription results must match the current account, request and credential generation.");
+        _subscriptionRequestVersion++;
+        if (IsCurrentSubscriptionRequest("PREVIEW", requestVersion, authStamp))
+            throw new InvalidOperationException("A superseded subscription request must not update the display.");
         _ring.Snapshot = _snapshot;
         Save(_ring, RingGeometry.FullSize, RingGeometry.FullSize, "preview-glass-circle.png");
         _ring.GlintOpacity = 1; _ring.GlintProgress = 0.18; _ring.InvalidateVisual();

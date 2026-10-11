@@ -373,7 +373,7 @@ internal sealed class CodexAppServerClient : IDisposable
 
     public void Dispose() => StopProcess();
 
-    private static (DateTime LastWriteUtc, long Length)? ReadAuthFileStamp()
+    internal static (DateTime LastWriteUtc, long Length)? ReadAuthFileStamp()
     {
         try
         {
