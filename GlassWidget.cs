@@ -78,6 +78,7 @@ internal sealed class GlassWidget : Window
         Background = Brushes.Transparent;
         Topmost = true;
         ShowInTaskbar = false;
+        if (!preview) { ShowActivated = false; Opacity = 0; }
         Icon = Interop.Imaging.CreateBitmapSourceFromHIcon(_appIcon.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.Manual;
@@ -139,6 +140,8 @@ internal sealed class GlassWidget : Window
             Top = area.Top / scale + 80;
             _collapsedLocation = new System.Windows.Point(Left, Top);
             if (preview) return;
+            HideToTaskbar();
+            Opacity = 1;
             _refreshTimer.Start();
             _ = RefreshAsync();
             SetAvailableRelease(_releaseUpdater.CachedRelease);
@@ -680,7 +683,10 @@ internal sealed class GlassWidget : Window
         Height = Math.Min(desiredHeight, maximumHeight);
         _panelScroll.VerticalScrollBarVisibility = desiredHeight > maximumHeight
             ? ScrollBarVisibility.Auto : ScrollBarVisibility.Disabled;
-        Top = Math.Clamp(Top, area.Top + 8, area.Bottom - Height - 8);
+        // Temporary taskbar details stay attached to the card as their content height changes.
+        Top = _taskbarPanelReturn is not null && !_taskbar.Bounds.IsEmpty
+            ? (_taskbar.Bounds.Top / _taskbar.DpiScale < area.Top ? area.Top + 8 : area.Bottom - Height - 8)
+            : Math.Clamp(Top, area.Top + 8, area.Bottom - Height - 8);
         if (_history?.IsVisible == true) PositionHistory();
     }
 
@@ -1116,11 +1122,8 @@ internal sealed class GlassWidget : Window
         var scale = _taskbar.DpiScale;
         var x = Math.Clamp((bar.Left + bar.Width / 2) / scale - Width / 2,
             area.Left + 8, Math.Max(area.Left + 8, area.Right - Width - 8));
-        var screen = WinForms.Screen.FromRectangle(new Drawing.Rectangle((int)bar.X, (int)bar.Y, (int)bar.Width, (int)bar.Height));
-        var atTop = bar.Top + bar.Height / 2 < screen.Bounds.Top + screen.Bounds.Height / 2;
-        var y = atTop ? area.Top + 8 : area.Bottom - Height - 8;
         SetWindowPos(new Interop.WindowInteropHelper(this).Handle, IntPtr.Zero,
-            (int)Math.Round(x * scale), (int)Math.Round(y * scale),
+            (int)Math.Round(x * scale), (int)Math.Round(Top * scale),
             (int)Math.Ceiling(Width * scale), (int)Math.Ceiling(Height * scale), 0x14);
         Show();
         Activate();
@@ -1148,9 +1151,18 @@ internal sealed class GlassWidget : Window
             if (!valid) throw new InvalidOperationException(message);
         }
         _snapshot = new QuotaSnapshot(new RateWindow(300, 7, null), new RateWindow(10_080, 60, null),
-            [], 0, [], null, DateTimeOffset.Now);
+            [], 2,
+            [new ResetCredit("Full reset", "available", DateTimeOffset.Now, DateTimeOffset.Now.AddDays(5)),
+             new ResetCredit("Full reset", "available", DateTimeOffset.Now, DateTimeOffset.Now.AddDays(12))],
+            null, DateTimeOffset.Now);
         _ring.Snapshot = _snapshot;
         var reports = new List<string>();
+        HideToTaskbar();
+        Check(_taskbarMode && !IsVisible && (_tray.Visible || _taskbar.Handle != IntPtr.Zero),
+            "Initial taskbar entry must hide the desktop widget and retain either the card or fallback icon.");
+        ShowFromTray();
+        Check(IsVisible && !_expanded && !_taskbarMode,
+            "The default taskbar view must still allow manual restoration of the circle.");
         var menu = _tray.ContextMenuStrip!;
         var details = (WinForms.ToolStripMenuItem)menu.Items[0];
         var restore = (WinForms.ToolStripMenuItem)menu.Items[1];
@@ -1194,8 +1206,8 @@ internal sealed class GlassWidget : Window
                 Check(coloredPixels > 10, "Taskbar card must be visibly rendered, not merely a valid native child HWND.");
             }
             Check(_expanded && _edge == edge, "Hiding must preserve expanded and docked states.");
-            for (var i = 0; i < 6; i++) _taskbar.ApplyPlacementResult(false);
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            for (var i = 0; i < 6; i++) _taskbar.ApplyPlacementResult(false);
             Check(_taskbarMode && !IsVisible && _tray.Visible && _taskbar.Handle == IntPtr.Zero && _expanded && _edge == edge,
                 "Repeated layout failures must keep the desktop hidden and expose the fallback notification icon.");
             menu.Show(new Drawing.Point(8, 8));
@@ -1226,10 +1238,24 @@ internal sealed class GlassWidget : Window
                 "Both the details menu action and a card single-click must keep the existing card visible.");
             var panelBottom = PointToScreen(new System.Windows.Point(0, Height));
             Check(panelBottom.Y <= bounds.Top, "Taskbar details must not cover the quota card.");
+            var compactTop = Top;
+            var compactHeight = Height;
+            ToggleCreditDetails();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            Check(Height > compactHeight && Top < compactTop &&
+                Math.Abs(PointToScreen(new System.Windows.Point(0, Height)).Y - panelBottom.Y) <= 2,
+                "Expanding reset details must grow upward while keeping the taskbar panel bottom anchored.");
+            ToggleCreditDetails();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
+            Check(Math.Abs(Height - compactHeight) <= 1 && Math.Abs(Top - compactTop) <= 1 &&
+                Math.Abs(PointToScreen(new System.Windows.Point(0, Height)).Y - panelBottom.Y) <= 2,
+                "Collapsing reset details must move the panel top downward without leaving a gap above the taskbar.");
             var previousPanel = _panel;
             RebuildPanel();
             Check(!ReferenceEquals(previousPanel, _panel) && _taskbar.Handle == taskbarHandle,
                 "Quota updates must rebuild visible taskbar details without removing the card.");
+            Check(Math.Abs(Top - compactTop) <= 1,
+                "Quota refresh must preserve the taskbar panel anchor.");
             _history = new HistoryGlass(new SnapshotStore(Path.Combine(Path.GetTempPath(), $"CodexLimitShow-empty-history-{Guid.NewGuid():N}.json")))
                 { Owner = this };
             PositionHistory();
@@ -1286,7 +1312,7 @@ internal sealed class GlassWidget : Window
                 "Manual restore during an outage must preserve the original view and stop automatic recovery.");
         }
         File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "taskbar-test.txt"),
-            "PASS: click routing, mouse menu shortcuts and routes, layout-failure tray fallback without desktop restore, safe card recovery, details with card retained, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
+            "PASS: initial taskbar entry and manual restoration, click routing, mouse menu shortcuts and routes, layout-failure tray fallback without desktop restore, safe card recovery, details with card retained, bottom-anchored reset details expansion/collapse and refresh, focus dismissal, history/modal protection, live panel rebuild, native child, visible rendering, safe placement, handle recreation, original ring/dock/panel restoration. Offline synthetic data only.\n" +
             string.Join("\n", reports));
     }
 
