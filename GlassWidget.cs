@@ -41,6 +41,7 @@ internal sealed class GlassWidget : Window
     private Version? _availableUpdate;
     private QuotaSnapshot? _snapshot;
     private HistoryGlass? _history;
+    private SubscriptionBrowser? _subscriptionBrowser;
     private Border? _panel;
     private StackPanel? _panelBody;
     private UniformGrid? _panelActions;
@@ -153,6 +154,7 @@ internal sealed class GlassWidget : Window
             _glintTimer.Stop();
             _clickTimer.Stop();
             _history?.Close();
+            _subscriptionBrowser?.Close();
             _taskbar.Dispose();
             _tray.Visible = false;
             _tray.Dispose();
@@ -247,7 +249,9 @@ internal sealed class GlassWidget : Window
             var saved = next.Account is null ? null : _store.Load().FirstOrDefault(x => x.StorageKey == next.Account.StorageKey);
             if (next.Account is not null && saved?.SubscriptionExpiresAt is not null)
                 next = next with { Account = next.Account with { SubscriptionExpiresAt = saved.SubscriptionExpiresAt,
-                    SubscriptionCheckedAt = saved.SubscriptionCheckedAt } };
+                    SubscriptionCheckedAt = saved.SubscriptionCheckedAt,
+                    SubscriptionDateOnly = saved.SubscriptionDateOnly,
+                    SubscriptionAutoRenews = saved.SubscriptionAutoRenews } };
             var authStamp = CodexAppServerClient.ReadAuthFileStamp();
             if (next.Account is { } localAccount &&
                 (oldAccount != localAccount.StorageKey || authStamp != _subscriptionAuthStamp || forceAccount))
@@ -280,9 +284,9 @@ internal sealed class GlassWidget : Window
                 (oldAccount != account.StorageKey || !_subscriptionAttempted.Contains(account.StorageKey)))
             {
                 _subscriptionAttempted.Add(account.StorageKey);
-                _ = VerifySubscriptionAsync(account.StorageKey);
+                if (!account.SubscriptionDateOnly) _ = VerifySubscriptionAsync(account.StorageKey);
             }
-            else if (next.Account is { } current && current.SubscriptionExpiresAt <= DateTimeOffset.Now &&
+            else if (next.Account is { } current && !current.SubscriptionDateOnly && current.SubscriptionNeedsVerification &&
                      !string.Equals(next.RateLimitPlanType ?? current.PlanType, "free", StringComparison.OrdinalIgnoreCase) &&
                      _expiryContradictionChecked.Add(current.StorageKey))
                 _ = VerifySubscriptionAsync(current.StorageKey);
@@ -313,6 +317,7 @@ internal sealed class GlassWidget : Window
 
     private async Task VerifySubscriptionAsync(string expectedKey)
     {
+        if (_subscriptionBrowser is not null) return;
         if (_snapshot?.Account is not { } account || account.StorageKey != expectedKey) return;
         var requestVersion = ++_subscriptionRequestVersion;
         var authStamp = CodexAppServerClient.ReadAuthFileStamp();
@@ -337,7 +342,7 @@ internal sealed class GlassWidget : Window
             else
             {
                 _snapshot = _snapshot with { Account = _snapshot.Account with { SubscriptionExpiresAt = expiry,
-                    SubscriptionCheckedAt = DateTimeOffset.Now } };
+                    SubscriptionCheckedAt = DateTimeOffset.Now, SubscriptionDateOnly = false, SubscriptionAutoRenews = null } };
                 _subscriptionError = null;
                 _store.Save(_snapshot);
             }
@@ -359,6 +364,40 @@ internal sealed class GlassWidget : Window
     private bool IsCurrentSubscriptionRequest(string expectedKey, int version, (DateTime LastWriteUtc, long Length)? authStamp) =>
         !_lifetime.IsCancellationRequested && _snapshot?.Account?.StorageKey == expectedKey &&
         _subscriptionRequestVersion == version && CodexAppServerClient.ReadAuthFileStamp() == authStamp;
+
+    private async Task VerifySubscriptionInBrowserAsync()
+    {
+        if (_subscriptionBrowser is not null || _snapshot?.Account is not { } account) return;
+        var version = ++_subscriptionRequestVersion;
+        var authStamp = CodexAppServerClient.ReadAuthFileStamp();
+        try
+        {
+            if (Process.GetProcessesByName("SubscriptionBrowserProbe").Length > 0)
+            {
+                _subscriptionError = "请先关闭独立网页验证工具，再使用组件内的网页核验。";
+                return;
+            }
+            _subscriptionBrowser = new SubscriptionBrowser(account.Label) { Owner = this, Topmost = true };
+            if (_subscriptionBrowser.ShowDialog() != true || _subscriptionBrowser.Result is not { } result) return;
+            var fresh = await _client.ReadCurrentAccountAsync(_lifetime.Token);
+            if (fresh?.StorageKey != account.StorageKey || !IsCurrentSubscriptionRequest(account.StorageKey, version, authStamp))
+            {
+                _subscriptionError = "核验期间 Codex 账号或登录状态发生变化，未采用网页日期。请重新核验。";
+                return;
+            }
+            _snapshot = _snapshot! with { Account = result.Apply(_snapshot!.Account!) };
+            _subscriptionError = _store.Save(_snapshot) ? null : "网页核验成功，但本地快照保存失败；重启后可能丢失本次结果。";
+            _ring.Snapshot = _snapshot;
+        }
+        finally
+        {
+            _subscriptionBrowser = null;
+            if (!_lifetime.IsCancellationRequested)
+            {
+                RebuildPanel(); _history?.Reload(); UpdateTaskbarData();
+            }
+        }
+    }
 
     private void RingDown(object sender, MouseButtonEventArgs e)
     {
@@ -473,7 +512,7 @@ internal sealed class GlassWidget : Window
     private void CollapseIfOutside()
     {
         if (IsVisible && _expanded && !IsActive && !_upgradeBusy &&
-            _history?.IsActive != true && ConfirmGlass.OpenCount == 0)
+            _history?.IsActive != true && _subscriptionBrowser is null && ConfirmGlass.OpenCount == 0)
         {
             if (_taskbarPanelReturn is not null) DismissTaskbarPanel();
             else if (!_taskbarMode) ToggleExpanded();
@@ -535,10 +574,7 @@ internal sealed class GlassWidget : Window
         };
         body.Children.Add(top);
         body.Children.Add(AccountCard(s));
-        var verify = BusyButton("subscription", "手动刷新有效期 ↗", "核验中…", () =>
-        {
-            return _snapshot?.Account is { } a ? VerifySubscriptionAsync(a.StorageKey) : Task.CompletedTask;
-        }, 150);
+        var verify = BusyButton("subscription", "网页核验有效期 ↗", "核验中…", VerifySubscriptionInBrowserAsync, 150);
         if (_snapshot?.Account is null) verify.IsEnabled = false;
         verify.HorizontalAlignment = HA.Left;
         verify.Margin = new Thickness(0, 7, 0, 13);
@@ -1426,8 +1462,8 @@ internal sealed class GlassWidget : Window
     }
     private void Exit() => Close();
 
-    internal static string ExpiryText(QuotaSnapshot? s) => s?.Account?.SubscriptionExpiresAt is { } date
-        ? $"{date.ToLocalTime():yyyy-MM-dd HH:mm}  {(date < DateTimeOffset.Now ? "待核验" : s.Account.SubscriptionCheckedAt is { } checkedAt ? $"核验 {checkedAt.ToLocalTime():MM-dd}" : "本地记录·待核验")}" : "未核验";
+    internal static string ExpiryText(QuotaSnapshot? s) => s?.Account is { SubscriptionExpiresAt: not null } account
+        ? $"{account.SubscriptionDateText}  {account.SubscriptionVerificationText}" : "未核验";
     private static string PlanText(QuotaSnapshot? s) => (s?.RateLimitPlanType ?? s?.Account?.PlanType ?? "未知套餐").ToUpperInvariant();
     private static string ResetText(DateTimeOffset? date)
     {
@@ -1490,6 +1526,16 @@ internal sealed class GlassWidget : Window
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel.png");
         if (_panelScroll!.ComputedVerticalScrollBarVisibility != Visibility.Collapsed)
             throw new InvalidOperationException("A fitting compact panel must not show a scrollbar.");
+        var beforeWebPreview = _snapshot;
+        var beforeWebError = _subscriptionError;
+        _snapshot = _snapshot! with { Account = new BrowserSubscription(new DateOnly(2026, 11, 2), false).Apply(_snapshot.Account!) };
+        _subscriptionError = null;
+        RebuildPanel(); FitPanelToContent(previewArea);
+        Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-web.png");
+        if (ExpiryText(_snapshot).Contains("00:00", StringComparison.Ordinal) || !ExpiryText(_snapshot).Contains("网页核验", StringComparison.Ordinal))
+            throw new InvalidOperationException("Web expiry must show date-only precision and its source.");
+        _snapshot = beforeWebPreview; _subscriptionError = beforeWebError;
+        RebuildPanel(); FitPanelToContent(previewArea);
         foreach (var key in new[] { "open", "upgrade" })
             if (_actionButtons[key].Control.Width != 32 || _actionButtons[key].Icon is null ||
                 string.IsNullOrWhiteSpace(System.Windows.Automation.AutomationProperties.GetName(_actionButtons[key].Control)))
@@ -1779,9 +1825,10 @@ internal sealed class HistoryGlass : Window
             Child = T(x.PlanType.ToUpperInvariant(), 9.5, C("#E9D6FF"), FontWeights.SemiBold) };
         Grid.SetColumn(plan, 1); accountRow.Children.Add(plan); stack.Children.Add(accountRow);
 
-        stack.Children.Add(InfoCard("订阅有效期", x.SubscriptionExpiresAt?.ToString("yyyy-MM-dd HH:mm") ?? "未核验",
+        stack.Children.Add(InfoCard("订阅有效期", (x.SubscriptionDateOnly ? x.SubscriptionExpiresAt : x.SubscriptionExpiresAt?.ToLocalTime())?.ToString(x.SubscriptionDateOnly ? "yyyy-MM-dd" : "yyyy-MM-dd HH:mm") ?? "未核验",
             x.SubscriptionCheckedAt is null ? x.SubscriptionExpiresAt is null ? "没有日期记录" : "本地登录记录，未联网核验"
-                : $"最后核验 {x.SubscriptionCheckedAt:yyyy-MM-dd HH:mm}"));
+                : $"最后{(x.SubscriptionDateOnly ? "网页" : "")}核验 {x.SubscriptionCheckedAt:yyyy-MM-dd HH:mm}" +
+                    (x.SubscriptionAutoRenews == false ? " · 已取消续订" : "")));
         stack.Children.Add(QuotaSnapshotCard("5 小时额度", x.FiveHour));
         var longWindow = x.Weekly ?? x.OtherWindows.FirstOrDefault(w => w.DurationMinutes is >= 40_320 and <= 44_640);
         stack.Children.Add(QuotaSnapshotCard(x.Weekly is null && longWindow is not null ? "月额度" : "7 天额度", longWindow));

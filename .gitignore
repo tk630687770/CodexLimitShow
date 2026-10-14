@@ -8,6 +8,8 @@
 !/LICENSE
 !/README.md
 !/tools/
+/tools/**/bin/
+/tools/**/obj/
 !/Assets/
 /Assets/*
 !/Assets/codex-logo.png

@@ -37,10 +37,27 @@ internal static class WpfMain
             RingGeometry.SelfTest();
             TaskbarQuotaWindow.SelfTest();
             SubscriptionLookup.SelfTest();
+            SubscriptionBrowser.SelfTest();
             ReleaseUpdater.SelfTest();
             var resetJson = System.Text.Json.JsonSerializer.Serialize(new ResetConsumeParameters("test-key"));
             if (!resetJson.Contains("idempotencyKey") || resetJson.Contains("creditId"))
                 throw new InvalidOperationException("Reset request must contain only the idempotency key.");
+            return;
+        }
+        if (args.Contains("--check-web-subscription", StringComparer.OrdinalIgnoreCase))
+        {
+            using var client = new CodexAppServerClient();
+            using var output = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+            AccountSummary? account;
+            try { account = client.ReadCurrentAccountAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+            catch (Exception ex) { output.WriteLine("web-subscription: account check failed; " + ex.GetType().Name); return; }
+            if (account is null) { output.WriteLine("web-subscription: account unavailable"); return; }
+            var checkApp = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            var browser = new SubscriptionBrowser(account.Label, checkOnly: true);
+            output.WriteLine(browser.ShowDialog() == true && browser.Result is { } result
+                ? $"web-subscription: account matched twice; date={result.Date:yyyy-MM-dd}; no snapshot written"
+                : "web-subscription: not verified; no snapshot written; " + (browser.Failure ?? "window closed"));
+            checkApp.Shutdown();
             return;
         }
         if (args.Contains("--probe", StringComparer.OrdinalIgnoreCase))
@@ -51,19 +68,24 @@ internal static class WpfMain
             output.WriteLine($"5h={snapshot.FiveHour?.RemainingPercent.ToString() ?? "inactive"}%; weekly={snapshot.Weekly?.RemainingPercent.ToString() ?? "inactive"}%; credits={snapshot.AvailableResetCredits?.ToString() ?? "unknown"}");
             return;
         }
-        if (args.Contains("--probe-subscription", StringComparer.OrdinalIgnoreCase))
+        var diagnoseSubscription = args.Contains("--diagnose-subscription", StringComparer.OrdinalIgnoreCase);
+        if (diagnoseSubscription || args.Contains("--probe-subscription", StringComparer.OrdinalIgnoreCase))
         {
             using var client = new CodexAppServerClient();
+            using var output = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
             try
             {
                 var snapshot = client.ReadSnapshotAsync(CancellationToken.None).GetAwaiter().GetResult();
                 if (snapshot.Account is null) throw new CodexClientException("当前账号不可用");
-                var expiry = new SubscriptionLookup().ReadExpiryAsync(snapshot.Account, CancellationToken.None).GetAwaiter().GetResult();
-                Console.WriteLine(expiry is null ? "subscription: unavailable" : $"subscription-local: {expiry:yyyy-MM-dd HH:mm zzz}");
+                var expiry = new SubscriptionLookup().ReadExpiryAsync(snapshot.Account, CancellationToken.None,
+                    diagnoseSubscription ? output.WriteLine : null).GetAwaiter().GetResult();
+                output.WriteLine(expiry is null ? "subscription: unavailable" : $"subscription-online: {expiry:yyyy-MM-dd HH:mm zzz}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"subscription-error: {(ex is CodexClientException ? ex.Message : ex.GetType().Name)}");
+                if (diagnoseSubscription && ex is HttpRequestException httpError)
+                    output.WriteLine($"subscription-transport: error={httpError.HttpRequestError}; status={(httpError.StatusCode is { } status ? ((int)status).ToString() : "none")}");
+                output.WriteLine($"subscription-error: {(!diagnoseSubscription && ex is CodexClientException ? ex.Message : ex.GetType().Name)}");
             }
             return;
         }

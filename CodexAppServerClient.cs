@@ -26,7 +26,18 @@ internal sealed record AccountSummary(
     string Label,
     string PlanType,
     DateTimeOffset? SubscriptionExpiresAt,
-    DateTimeOffset? SubscriptionCheckedAt = null);
+    DateTimeOffset? SubscriptionCheckedAt = null,
+    bool SubscriptionDateOnly = false,
+    bool? SubscriptionAutoRenews = null)
+{
+    internal string SubscriptionDateText => (SubscriptionDateOnly ? SubscriptionExpiresAt : SubscriptionExpiresAt?.ToLocalTime())
+        ?.ToString(SubscriptionDateOnly ? "yyyy-MM-dd" : "yyyy-MM-dd HH:mm") ?? "未核验";
+    internal bool SubscriptionNeedsVerification => SubscriptionExpiresAt is { } date &&
+        (SubscriptionDateOnly ? DateOnly.FromDateTime(date.DateTime) < DateOnly.FromDateTime(DateTime.Now) : date < DateTimeOffset.Now);
+    internal string SubscriptionVerificationText => (SubscriptionNeedsVerification ? "待核验" :
+        SubscriptionCheckedAt is { } checkedAt ? $"{(SubscriptionDateOnly ? "网页核验" : "核验")} {checkedAt.ToLocalTime():MM-dd}" :
+        "本地记录·待核验") + (SubscriptionAutoRenews == false ? " · 已取消续订" : "");
+}
 
 internal sealed record QuotaSnapshot(
     RateWindow? FiveHour,
@@ -74,6 +85,22 @@ internal sealed class CodexAppServerClient : IDisposable
     private bool _forceAccountCheck;
 
     public string? ExecutablePath { get; private set; }
+
+    public async Task<AccountSummary?> ReadCurrentAccountAsync(CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var stamp = ReadAuthFileStamp();
+            if (_authFileChecked && stamp != _authFileStamp) StopProcess();
+            _authFileStamp = stamp; _authFileChecked = true;
+            await EnsureStartedAsync(cancellationToken);
+            using var response = await RequestAsync("account/read", cancellationToken, new { refreshToken = false });
+            return QuotaParser.ParseAccount(GetResult(response.RootElement));
+        }
+        catch { StopProcess(); throw; }
+        finally { _gate.Release(); }
+    }
 
     public async Task<QuotaSnapshot> ReadSnapshotAsync(CancellationToken cancellationToken, bool verifyAccount = false)
     {

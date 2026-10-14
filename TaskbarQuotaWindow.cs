@@ -425,6 +425,10 @@ internal sealed class TaskbarQuotaWindow : IDisposable
         Check(((string)card._tooltip.Content).Split('\n')[2] ==
             $"订阅到期 {expiry.ToLocalTime():yyyy-MM-dd HH:mm}  核验 {checkedAt.ToLocalTime():MM-dd}");
         var pastExpiry = DateTimeOffset.UtcNow.AddDays(-1);
+        var webAccount = new BrowserSubscription(DateOnly.FromDateTime(DateTime.Now).AddDays(10), false).Apply(account);
+        card.Update(snapshot with { Account = webAccount }, false);
+        Check(((string)card._tooltip.Content).Split('\n')[2] ==
+            $"订阅到期 {webAccount.SubscriptionDateText}  网页核验 {webAccount.SubscriptionCheckedAt!.Value.ToLocalTime():MM-dd} · 已取消续订");
         card.Update(snapshot with { Account = account with { SubscriptionExpiresAt = pastExpiry, SubscriptionCheckedAt = checkedAt } }, true);
         Check(((string)card._tooltip.Content).Split('\n')[2] == $"订阅到期 {pastExpiry.ToLocalTime():yyyy-MM-dd HH:mm}  待核验");
         card.Update(null, false);

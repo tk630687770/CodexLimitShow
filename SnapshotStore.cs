@@ -14,7 +14,9 @@ internal sealed record SavedAccountSnapshot(
     IReadOnlyList<ResetCredit> ResetCredits,
     UsageStats? Usage,
     DateTimeOffset SavedAt,
-    DateTimeOffset? SubscriptionCheckedAt = null)
+    DateTimeOffset? SubscriptionCheckedAt = null,
+    bool SubscriptionDateOnly = false,
+    bool? SubscriptionAutoRenews = null)
 {
     public static SavedAccountSnapshot From(QuotaSnapshot snapshot) => new(
         snapshot.Account!.StorageKey,
@@ -28,7 +30,9 @@ internal sealed record SavedAccountSnapshot(
         snapshot.ResetCredits,
         snapshot.Usage,
         snapshot.FetchedAt,
-        snapshot.Account.SubscriptionCheckedAt);
+        snapshot.Account.SubscriptionCheckedAt,
+        snapshot.Account.SubscriptionDateOnly,
+        snapshot.Account.SubscriptionAutoRenews);
 }
 
 internal sealed class SnapshotStore
@@ -62,7 +66,9 @@ internal sealed class SnapshotStore
                 var updated = SavedAccountSnapshot.From(snapshot);
                 if (updated.SubscriptionExpiresAt is null && old?.SubscriptionExpiresAt is not null)
                     updated = updated with { SubscriptionExpiresAt = old.SubscriptionExpiresAt,
-                        SubscriptionCheckedAt = old.SubscriptionCheckedAt };
+                        SubscriptionCheckedAt = old.SubscriptionCheckedAt,
+                        SubscriptionDateOnly = old.SubscriptionDateOnly,
+                        SubscriptionAutoRenews = old.SubscriptionAutoRenews };
                 entries.Add(updated);
                 entries.Sort((left, right) => right.SavedAt.CompareTo(left.SavedAt));
 
@@ -129,6 +135,10 @@ internal sealed class SnapshotStore
             Check(store.Save(snapshot with { Account = snapshot.Account! with { SubscriptionExpiresAt = expiry } }));
             Check(store.Save(snapshot));
             Check(store.Load()[0].SubscriptionExpiresAt == expiry);
+            Check(store.Save(snapshot with { Account = snapshot.Account! with { SubscriptionExpiresAt = expiry,
+                SubscriptionCheckedAt = DateTimeOffset.Now, SubscriptionDateOnly = true, SubscriptionAutoRenews = false } }));
+            Check(store.Save(snapshot));
+            Check(store.Load()[0] is { SubscriptionDateOnly: true, SubscriptionAutoRenews: false, SubscriptionCheckedAt: not null });
             Check(!File.ReadAllText(path).Contains("\"id\"", StringComparison.OrdinalIgnoreCase));
         }
         finally

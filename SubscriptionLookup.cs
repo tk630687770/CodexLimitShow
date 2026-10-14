@@ -12,8 +12,11 @@ internal sealed class SubscriptionLookup
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
 
     internal static AccountSummary MergeLocalExpiry(AccountSummary account, DateTimeOffset? localExpiry) =>
-        localExpiry is { } local && (account.SubscriptionExpiresAt is null || local > account.SubscriptionExpiresAt)
-            ? account with { SubscriptionExpiresAt = local, SubscriptionCheckedAt = null }
+        localExpiry is { } local && (account.SubscriptionExpiresAt is null ||
+            (account.SubscriptionDateOnly ? DateOnly.FromDateTime(local.LocalDateTime) > DateOnly.FromDateTime(account.SubscriptionExpiresAt.Value.DateTime)
+                : local > account.SubscriptionExpiresAt))
+            ? account with { SubscriptionExpiresAt = local, SubscriptionCheckedAt = null,
+                SubscriptionDateOnly = false, SubscriptionAutoRenews = null }
             : account;
 
     public DateTimeOffset? ReadLocalExpiry(AccountSummary expected)
@@ -30,7 +33,8 @@ internal sealed class SubscriptionLookup
         return expiry;
     }
 
-    public async Task<DateTimeOffset?> ReadExpiryAsync(AccountSummary expected, CancellationToken token)
+    public async Task<DateTimeOffset?> ReadExpiryAsync(AccountSummary expected, CancellationToken token,
+        Action<string>? diagnostic = null)
     {
         var authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
         using var auth = JsonDocument.Parse(await File.ReadAllTextAsync(authPath, token));
@@ -45,18 +49,17 @@ internal sealed class SubscriptionLookup
         var offset = -(int)TimeZoneInfo.Local.GetUtcOffset(DateTimeOffset.Now).TotalMinutes;
         try
         {
-            using var check = await GetAsync($"/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min={offset}", accessToken, null, token);
+            using var check = await GetAsync($"/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min={offset}", accessToken, null, token, diagnostic);
             var expiry = FindMatchingExpiry(check.RootElement, accountId);
             if (expiry is not null && expiry > DateTimeOffset.Now)
                 return expiry;
         }
-        catch (CodexClientException ex) when (!ex.Message.Contains("HTTP 401", StringComparison.Ordinal) &&
-                                               !ex.Message.Contains("网页防护拦截", StringComparison.Ordinal))
+        catch (CodexClientException ex) when (CanTryAlternateView(ex))
         {
             // This private endpoint is not stable. Try the account-scoped subscription view once.
         }
 
-        using var subscriptions = await GetAsync("/backend-api/subscriptions?account_id=" + Uri.EscapeDataString(accountId), accessToken, null, token);
+        using var subscriptions = await GetAsync("/backend-api/subscriptions?account_id=" + Uri.EscapeDataString(accountId), accessToken, null, token, diagnostic);
         var matched = FindMatchingExpiry(subscriptions.RootElement, accountId);
         if (matched is not null) return matched;
         // The subscription endpoint can return a single account-scoped object without an ID.
@@ -66,7 +69,8 @@ internal sealed class SubscriptionLookup
             ParseDateProperty(subscriptions.RootElement, "expires_at");
     }
 
-    private static async Task<JsonDocument> GetAsync(string path, string accessToken, string? accountId, CancellationToken token)
+    private static async Task<JsonDocument> GetAsync(string path, string accessToken, string? accountId,
+        CancellationToken token, Action<string>? diagnostic)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri("https://chatgpt.com" + path));
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
@@ -78,6 +82,7 @@ internal sealed class SubscriptionLookup
         if (accountId is not null)
             request.Headers.TryAddWithoutValidation("ChatGPT-Account-Id", accountId);
         using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+        diagnostic?.Invoke(ResponseDiagnostic(response));
         if (!response.IsSuccessStatusCode)
         {
             throw new CodexClientException(IsWebProtectionResponse(response)
@@ -90,8 +95,38 @@ internal sealed class SubscriptionLookup
 
     private static bool IsWebProtectionResponse(HttpResponseMessage response) =>
         response.StatusCode == System.Net.HttpStatusCode.Forbidden &&
-        response.Content.Headers.ContentType?.MediaType == "text/html" &&
-        response.Headers.Server.Any(value => value.Product?.Name?.Equals("cloudflare", StringComparison.OrdinalIgnoreCase) == true);
+        HasChallengeMarker(response);
+
+    private static bool HasChallengeMarker(HttpResponseMessage response) =>
+        response.Headers.TryGetValues("cf-mitigated", out var values) &&
+        values.Any(value => value.Equals("challenge", StringComparison.OrdinalIgnoreCase));
+
+    private static bool CanTryAlternateView(CodexClientException error) =>
+        !error.Message.Contains("HTTP 401", StringComparison.Ordinal) &&
+        !error.Message.Contains("HTTP 403", StringComparison.Ordinal) &&
+        !error.Message.Contains("网页防护拦截", StringComparison.Ordinal);
+
+    private static string ResponseDiagnostic(HttpResponseMessage response)
+    {
+        // Allowlist every text field; redirects, queries, headers and bodies may contain private data.
+        var uri = response.RequestMessage?.RequestUri;
+        var host = uri?.Host.Equals("chatgpt.com", StringComparison.OrdinalIgnoreCase) == true ? "chatgpt.com" : "other";
+        var route = uri?.AbsolutePath switch
+        {
+            "/backend-api/accounts/check/v4-2023-04-27" => "accounts-check",
+            "/backend-api/subscriptions" => "subscriptions",
+            _ => "other"
+        };
+        var mediaType = response.Content.Headers.ContentType?.MediaType switch
+        {
+            "text/html" => "text/html",
+            "application/json" => "application/json",
+            null => "missing",
+            _ => "other"
+        };
+        return $"subscription-http: status={(int)response.StatusCode}; content-type={mediaType}; " +
+            $"challenge={HasChallengeMarker(response)}; host={host}; route={route}";
+    }
 
     private static bool TryReadTokenClaims(string? jwt, string accountId, string expectedEmail,
         out DateTimeOffset? subscriptionExpiry)
@@ -176,7 +211,28 @@ internal sealed class SubscriptionLookup
         using var blocked = new HttpResponseMessage(System.Net.HttpStatusCode.Forbidden)
             { Content = new StringContent("blocked", System.Text.Encoding.UTF8, "text/html") };
         blocked.Headers.Server.ParseAdd("cloudflare");
-        if (!IsWebProtectionResponse(blocked)) throw new InvalidOperationException("Cloudflare block classification failed.");
+        if (IsWebProtectionResponse(blocked)) throw new InvalidOperationException("Cloudflare server alone must not imply a challenge.");
+        blocked.Headers.TryAddWithoutValidation("cf-mitigated", "challenge");
+        if (!IsWebProtectionResponse(blocked)) throw new InvalidOperationException("Explicit challenge classification failed.");
+        blocked.Headers.Server.Clear();
+        if (!IsWebProtectionResponse(blocked)) throw new InvalidOperationException("Challenge detection must not depend on Server.");
+        blocked.Headers.TryAddWithoutValidation("Set-Cookie", "session=must-not-leak");
+        using var privateRequest = new HttpRequestMessage(HttpMethod.Get,
+            "https://chatgpt.com/backend-api/subscriptions?account_id=must-not-leak");
+        blocked.RequestMessage = privateRequest;
+        var safeDiagnostic = ResponseDiagnostic(blocked);
+        if (safeDiagnostic != "subscription-http: status=403; content-type=text/html; challenge=True; host=chatgpt.com; route=subscriptions" ||
+            safeDiagnostic.Contains("must-not-leak", StringComparison.Ordinal))
+            throw new InvalidOperationException("Subscription diagnostics must contain only allowlisted metadata.");
+        using var redirectedRequest = new HttpRequestMessage(HttpMethod.Get, "https://must-not-leak.example/private/must-not-leak");
+        blocked.RequestMessage = redirectedRequest;
+        if (ResponseDiagnostic(blocked).Contains("must-not-leak", StringComparison.Ordinal))
+            throw new InvalidOperationException("Redirect diagnostics must not expose arbitrary hosts or paths.");
+        if (CanTryAlternateView(new CodexClientException("HTTP 401")) ||
+            CanTryAlternateView(new CodexClientException("HTTP 403")) ||
+            CanTryAlternateView(new CodexClientException("网页防护拦截")) ||
+            !CanTryAlternateView(new CodexClientException("HTTP 404")))
+            throw new InvalidOperationException("Subscription access denials must stop without trying more endpoints.");
         using var sample = JsonDocument.Parse("""
             {"accounts":[{"account":{"id":"other"},"entitlement":{"expires_at":"2026-10-01T00:00:00Z"}},
             {"account":{"id":"wanted"},"entitlement":{"expires_at":"2026-11-01T00:00:00Z"}}]}
