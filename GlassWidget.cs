@@ -1402,7 +1402,7 @@ internal sealed class GlassWidget : Window
                     "升级程序", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
             _upgradeDownloading = true;
             SetUpgradeVisual("下载中", 0);
-            if (_status is not null) _status.Text = "正在下载 GitHub 正式版…";
+            if (_status is not null) _status.Text = new DownloadProgress(0, null, false, Mirror: _releaseUpdater.MetadataViaMirror).Description;
             var progress = new Progress<DownloadProgress>(value =>
             {
                 if (!_upgradeBusy || !_upgradeDownloading) return;
@@ -1415,16 +1415,12 @@ internal sealed class GlassWidget : Window
                 if (value.Verifying)
                 {
                     SetUpgradeVisual("校验中", null);
-                    if (_status is not null) _status.Text = "正在校验下载文件…";
                 }
                 else
                 {
                     SetUpgradeVisual("下载中", value.Percent);
-                    if (_status is not null)
-                        _status.Text = value.Total is > 0
-                            ? $"下载中 {value.Percent}% · {value.Received / 1_048_576} / {value.Total.Value / 1_048_576} MB"
-                            : $"下载中 · 已接收 {value.Received / 1_048_576} MB";
                 }
+                if (_status is not null) _status.Text = value.Description;
             });
             var downloaded = await _releaseUpdater.DownloadAsync(remote, progress, CancellationToken.None);
             _upgradeDownloading = false;
@@ -1645,11 +1641,13 @@ internal sealed class GlassWidget : Window
         _busyActions.Add("upgrade");
         SetUpgradeVisual("下载中", 42);
         RebuildPanel();
+        _status!.Text = new DownloadProgress(42 * 1_048_576L, 100 * 1_048_576L, false, Mirror: true).Description;
         FitPanelToContent(previewArea);
         Save((UIElement)Content, 400, (int)Math.Ceiling(Height), "preview-glass-panel-downloading.png");
         var downloadBar = (System.Windows.Controls.ProgressBar)_actionButtons["upgrade"].Icon!.Children[1];
         if (downloadBar.IsIndeterminate || downloadBar.Value != 42 || downloadBar.Visibility != Visibility.Visible ||
-            !_actionButtons["upgrade"].Control.ToolTip.ToString()!.Contains("42%"))
+            !_actionButtons["upgrade"].Control.ToolTip.ToString()!.Contains("42%") ||
+            !_status.Text.Contains("备用线路") || _panelScroll!.ComputedVerticalScrollBarVisibility != Visibility.Collapsed)
             throw new InvalidOperationException("Icon-only downloads must retain real progress and a stage tooltip.");
         _busyActions.Clear();
         _upgradeBusyLabel = "检查中…";

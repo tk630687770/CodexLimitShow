@@ -9,9 +9,13 @@ using System.Text.RegularExpressions;
 namespace CodexLimitShow;
 
 internal sealed record RemoteReleaseCandidate(Version Version, string DownloadUrl, string Sha256, string? Signature = null);
-internal readonly record struct DownloadProgress(long Received, long? Total, bool Verifying, string? Status = null)
+internal readonly record struct DownloadProgress(long Received, long? Total, bool Verifying, string? Status = null, bool Mirror = false)
 {
     public int? Percent => Total is > 0 ? (int)Math.Clamp(Received * 100 / Total.Value, 0, 100) : null;
+    public string Route => Mirror ? "备用线路" : "GitHub";
+    public string Description => Verifying ? $"正在校验下载文件 · {Route}" : Total is > 0
+        ? $"下载中 {Percent}% · {Received / 1_048_576} / {Total.Value / 1_048_576} MB · {Route}"
+        : $"下载中 · 已接收 {Received / 1_048_576} MB · {Route}";
 }
 
 internal sealed class ReleaseUpdater
@@ -37,6 +41,7 @@ internal sealed class ReleaseUpdater
 
     public static TimeSpan AutomaticCheckInterval => TimeSpan.FromHours(24);
     public RemoteReleaseCandidate? CachedRelease { get; private set; }
+    public bool MetadataViaMirror { get; private set; }
     public TimeSpan AutomaticCheckDelay
     {
         get
@@ -106,7 +111,7 @@ internal sealed class ReleaseUpdater
         if (!mirror && EntityTagHeaderValue.TryParse(_etag, out var tag)) request.Headers.IfNoneMatch.Add(tag);
         using var response = await _github.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attempt.Token)
             .ConfigureAwait(false);
-        if (!mirror && response.StatusCode == HttpStatusCode.NotModified) return;
+        if (!mirror && response.StatusCode == HttpStatusCode.NotModified) { MetadataViaMirror = false; return; }
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
             CachedRelease = null;
@@ -131,6 +136,7 @@ internal sealed class ReleaseUpdater
             CachedRelease = ParseRemoteRelease(document.RootElement, mirror, _verificationKey);
             _etag = mirror ? null : response.Headers.ETag?.ToString();
         }
+        MetadataViaMirror = mirror;
     }
 
     private static bool IsNetworkFailure(Exception error, CancellationToken token) => !token.IsCancellationRequested &&
@@ -246,11 +252,12 @@ internal sealed class ReleaseUpdater
         {
             using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             budget.CancelAfter(TimeSpan.FromMinutes(10));
-            try { await DownloadRouteAsync(remote, destination, false, progress, budget.Token).ConfigureAwait(false); }
-            catch (Exception ex) when (IsNetworkFailure(ex, budget.Token))
+            var mirror = MetadataViaMirror;
+            try { await DownloadRouteAsync(remote, destination, mirror, progress, budget.Token).ConfigureAwait(false); }
+            catch (Exception ex) when (!mirror && IsNetworkFailure(ex, budget.Token))
             {
                 if (File.Exists(destination)) File.Delete(destination);
-                progress?.Report(new DownloadProgress(0, null, false, "GitHub 下载失败，正在切换备用线路重新下载…"));
+                progress?.Report(new DownloadProgress(0, null, false, "GitHub 下载失败，正在切换备用线路重新下载…", Mirror: true));
                 await DownloadRouteAsync(remote, destination, true, progress, budget.Token).ConfigureAwait(false);
             }
             return destination;
@@ -274,7 +281,7 @@ internal sealed class ReleaseUpdater
         var expectedBytes = response.Content.Headers.ContentLength;
         if (expectedBytes > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
         if (expectedBytes is <= 0) expectedBytes = null;
-        progress?.Report(new DownloadProgress(0, expectedBytes, false));
+        progress?.Report(new DownloadProgress(0, expectedBytes, false, Mirror: mirror));
         long total = 0;
         await using (var source = await response.Content.ReadAsStreamAsync(attempt.Token).ConfigureAwait(false))
         await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None))
@@ -291,7 +298,7 @@ internal sealed class ReleaseUpdater
                 total += read;
                 if (total > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
                 await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-                var current = new DownloadProgress(total, expectedBytes, false);
+                var current = new DownloadProgress(total, expectedBytes, false, Mirror: mirror);
                 if ((current.Percent is { } percent && percent > lastPercent) ||
                     (expectedBytes is null && total - lastReportedBytes >= 1_048_576))
                 {
@@ -301,7 +308,7 @@ internal sealed class ReleaseUpdater
                 }
             }
         }
-        progress?.Report(new DownloadProgress(total, expectedBytes, true));
+        progress?.Report(new DownloadProgress(total, expectedBytes, true, Mirror: mirror));
         if (expectedBytes is not null && total != expectedBytes) throw new HttpRequestException("下载未完成。");
         if (!HashMatches(destination, remote.Sha256) || _readVersion(destination) != remote.Version)
             throw new InvalidDataException("GitHub 发布程序校验失败。");
@@ -405,23 +412,15 @@ internal sealed class ReleaseUpdater
             var service = new ReleaseUpdater(github: client, cachePath: cachePath);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
             var remote = await service.CheckRemoteAsync(timeout.Token) ?? throw new InvalidDataException("没有可验证的正式版。");
-            output.WriteLine($"direct metadata: v{remote.Version}; SHA-256 obtained from GitHub");
-            try
-            {
-                await service.ReadMetadataAsync(true, timeout.Token);
-                output.WriteLine("mirror metadata: release signature verified");
-            }
-            catch (InvalidDataException ex) when (remote.Signature is null &&
-                ex.Message.StartsWith("发布签名缺失或无效", StringComparison.Ordinal))
-            {
-                output.WriteLine("mirror metadata: reachable, but current legacy release is unsigned; secure fallback correctly refused");
-            }
+            if (!service.MetadataViaMirror || remote.Signature is null)
+                throw new InvalidDataException("诊断必须使用签名验证通过的备用元数据。");
+            output.WriteLine($"mirror metadata: v{remote.Version}; release signature verified; direct API and EXE routes simulated blocked");
             downloaded = await service.DownloadAsync(remote, new TestProgress<DownloadProgress>(value =>
             {
                 if (value.Status is not null) output.WriteLine(value.Status);
-                if (value.Verifying) output.WriteLine("download complete; verifying hash and EXE product/file version");
+                if (value.Verifying) output.WriteLine(value.Description + "; verifying hash and EXE product/file version");
             }), CancellationToken.None);
-            output.WriteLine($"PASS: real mirror download v{remote.Version} verified against direct GitHub SHA-256; not executed or installed");
+            output.WriteLine($"PASS: real mirror metadata and download v{remote.Version} verified with pinned signature, SHA-256 and EXE versions; not executed or installed");
         }
         finally
         {
@@ -434,8 +433,8 @@ internal sealed class ReleaseUpdater
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            if (request.RequestUri!.Host == "github.com")
-                throw new HttpRequestException("Simulated blocked direct EXE download for the read-only mirror probe.");
+            if (request.RequestUri!.Host is "github.com" or "api.github.com")
+                throw new HttpRequestException("Simulated blocked direct API/EXE routes for the read-only mirror probe.");
             return Github.GetAsync(request.RequestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         }
     }
@@ -461,6 +460,11 @@ internal sealed class ReleaseUpdater
             new DownloadProgress(150, 100, false).Percent != 100 ||
             new DownloadProgress(50, null, false).Percent is not null)
             throw new Exception("Download progress calculation failed.");
+        if (!new DownloadProgress(50, 100, false, Mirror: true).Description.Contains("50%") ||
+            !new DownloadProgress(50, 100, false, Mirror: true).Description.EndsWith("备用线路", StringComparison.Ordinal) ||
+            !new DownloadProgress(50, null, false).Description.EndsWith("GitHub", StringComparison.Ordinal) ||
+            !new DownloadProgress(100, 100, true, Mirror: true).Description.Contains("校验"))
+            throw new Exception("Download status must retain its route during transfer and verification.");
         var root = Path.Combine(Path.GetTempPath(), $"CodexLimitShow-update-test-{Guid.NewGuid():N}");
         try
         {
@@ -530,7 +534,9 @@ internal sealed class ReleaseUpdater
             restarted.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult() != service.CachedRelease || calls != 1)
             throw new Exception("Restart or repeated automatic check bypassed the 24-hour interval.");
         now += AutomaticCheckInterval;
-        if (restarted.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult()?.Version != new Version(2, 0, 0) || calls != 2)
+        restarted.MetadataViaMirror = true;
+        if (restarted.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult()?.Version != new Version(2, 0, 0) ||
+            calls != 2 || restarted.MetadataViaMirror)
             throw new Exception("Conditional metadata check lost the cached release.");
         var failed = false;
         try { restarted.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult(); }
@@ -600,13 +606,19 @@ internal sealed class ReleaseUpdater
         var downloadEvents = new List<DownloadProgress>();
         var metadataUrl = $"https://api.github.com/repos/{Repository}/releases/latest";
         var brokenDownload = false;
+        var directMetadataFails = true;
+        var mirrorDownloadOffline = false;
         using var client = new HttpClient(new MetadataTestHandler(request =>
         {
             var url = request.RequestUri!.AbsoluteUri;
             calls.Add(url);
             if (request.Headers.Authorization is not null || request.Headers.Contains("Cookie"))
                 throw new Exception("Credentials were sent to an update endpoint.");
-            if (url == metadataUrl) throw new TaskCanceledException("Simulated direct connection timeout.");
+            if (url == metadataUrl)
+            {
+                if (directMetadataFails) throw new TaskCanceledException("Simulated direct connection timeout.");
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(signedJson) };
+            }
             if (url == MirrorPrefix + metadataUrl)
             {
                 if (request.Headers.IfNoneMatch.Any()) throw new Exception("Direct ETag was sent to a mirror.");
@@ -619,36 +631,66 @@ internal sealed class ReleaseUpdater
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = partial };
             }
             if (url == MirrorPrefix + remote.DownloadUrl)
+            {
+                if (mirrorDownloadOffline) throw new HttpRequestException("Simulated mirror unavailable.");
                 return new HttpResponseMessage(HttpStatusCode.OK)
                 { Content = new ByteArrayContent(brokenDownload ? Encoding.UTF8.GetBytes("tampered") : bytes) };
+            }
             throw new Exception("Unexpected update URL: " + url);
         }));
         var cachePath = Path.Combine(root, "mirror-cache.json");
         var service = new ReleaseUpdater(_ => remote.Version, client, cachePath, verificationKey: key);
         var result = service.CheckRemoteAsync(CancellationToken.None, new TestProgress<string>(messages.Add)).GetAwaiter().GetResult();
-        if (result?.Signature != signature || calls.Count != 2 || messages.Count != 1)
+        if (result?.Signature != signature || calls.Count != 2 || messages.Count != 1 || !service.MetadataViaMirror)
             throw new Exception("Metadata did not fall back once after a direct timeout.");
         var restarted = new ReleaseUpdater(github: client, cachePath: cachePath, verificationKey: key);
         restarted.CheckAutomaticallyAsync(CancellationToken.None).GetAwaiter().GetResult();
-        if (calls.Count != 2 || restarted.CachedRelease != result || restarted.AutomaticCheckDelay < TimeSpan.FromHours(23))
+        if (calls.Count != 2 || restarted.CachedRelease != result || restarted.MetadataViaMirror ||
+            restarted.AutomaticCheckDelay < TimeSpan.FromHours(23))
             throw new Exception("Mirrored signed cache did not survive restart and throttle checks.");
         var destination = service.DownloadAsync(result!, new TestProgress<DownloadProgress>(downloadEvents.Add),
             CancellationToken.None).GetAwaiter().GetResult();
         try
         {
-            if (!File.ReadAllBytes(destination).SequenceEqual(bytes) || calls.Count != 4 ||
-                downloadEvents.Count(e => e.Status is not null) != 1 || !downloadEvents[^1].Verifying)
-                throw new Exception("Partial direct download did not restart and verify through the mirror.");
+            if (!File.ReadAllBytes(destination).SequenceEqual(bytes) || calls.Count != 3 ||
+                downloadEvents.Any(e => e.Status is not null || !e.Mirror) || !downloadEvents[^1].Verifying)
+                throw new Exception("A successful mirrored metadata check must avoid retrying the known-failed direct download route.");
         }
         finally { File.Delete(destination); }
+        mirrorDownloadOffline = true;
+        var beforeOfflineCalls = calls.Count;
+        var mirrorFailureReported = false;
+        try { service.DownloadAsync(result!, null, CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (HttpRequestException) { mirrorFailureReported = true; }
+        if (!mirrorFailureReported || calls.Count != beforeOfflineCalls + 1)
+            throw new Exception("A failed selected mirror must not retry the already-failed direct route.");
+        mirrorDownloadOffline = false;
         brokenDownload = true;
+        var beforeBrokenCalls = calls.Count;
         var before = Directory.GetFiles(UpdateDirectory()).Order().ToArray();
         var badFileRejected = false;
         try { service.DownloadAsync(result!, null, CancellationToken.None).GetAwaiter().GetResult(); }
         catch (InvalidDataException) { badFileRejected = true; }
-        if (!badFileRejected || !Directory.GetFiles(UpdateDirectory()).Order().SequenceEqual(before))
+        if (!badFileRejected || calls.Count != beforeBrokenCalls + 1 ||
+            !Directory.GetFiles(UpdateDirectory()).Order().SequenceEqual(before))
             throw new Exception("Tampered mirror download was accepted or left a partial executable behind.");
         brokenDownload = false;
+        directMetadataFails = false;
+        service.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult();
+        if (service.MetadataViaMirror || calls[^1] != metadataUrl)
+            throw new Exception("A recovered direct metadata check must restore direct download preference.");
+        var beforePartialCalls = calls.Count;
+        downloadEvents.Clear();
+        destination = service.DownloadAsync(result!, new TestProgress<DownloadProgress>(downloadEvents.Add),
+            CancellationToken.None).GetAwaiter().GetResult();
+        try
+        {
+            if (calls.Count != beforePartialCalls + 2 || downloadEvents.Count(e => e.Status is not null) != 1 ||
+                !downloadEvents.Any(e => !e.Mirror) || !downloadEvents[^1].Mirror ||
+                !File.ReadAllBytes(destination).SequenceEqual(bytes))
+                throw new Exception("A partial direct download must still restart on the backup route with correct progress labels.");
+        }
+        finally { File.Delete(destination); }
         var wrongVersion = new ReleaseUpdater(_ => new Version(2, 0, 1), client,
             Path.Combine(root, "wrong-version.json"), verificationKey: key);
         var wrongVersionRejected = false;
