@@ -10,6 +10,18 @@ internal static class WpfMain
     {
         // The WPF surface and WinForms tray must share the same process DPI context.
         System.Windows.Forms.Application.SetHighDpiMode(System.Windows.Forms.HighDpiMode.PerMonitorV2);
+        if (args.Contains("--check-update-mirror", StringComparer.OrdinalIgnoreCase))
+        {
+            using var output = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+            try { ReleaseUpdater.VerifyMirrorAsync(output).GetAwaiter().GetResult(); }
+            catch (Exception ex)
+            {
+                output.WriteLine($"mirror probe failed: {ex.GetType().Name}" +
+                    (ex is InvalidDataException ? $"; {ex.Message}" : ""));
+                Environment.ExitCode = 1;
+            }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--apply-update")
         {
             try

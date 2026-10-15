@@ -1355,7 +1355,7 @@ internal sealed class GlassWidget : Window
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            timeout.CancelAfter(TimeSpan.FromSeconds(25));
             var release = await _releaseUpdater.CheckAutomaticallyAsync(timeout.Token);
             if (!_lifetime.IsCancellationRequested) SetAvailableRelease(release);
         }
@@ -1381,22 +1381,24 @@ internal sealed class GlassWidget : Window
             Exception? remoteError = null;
             try
             {
-                using var checkTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                remote = await _releaseUpdater.CheckRemoteAsync(checkTimeout.Token);
+                using var checkTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+                var checkStatus = new Progress<string>(message =>
+                    { if (_upgradeBusy && !_upgradeDownloading && _status is not null) _status.Text = message; });
+                remote = await _releaseUpdater.CheckRemoteAsync(checkTimeout.Token, checkStatus);
                 SetAvailableRelease(remote);
             }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException)
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Text.Json.JsonException or InvalidDataException)
             { remoteError = ex; }
             if (remote is null || remote.Version <= current)
             {
                 System.Windows.MessageBox.Show(this, remoteError is null
                     ? $"当前版本 {current}，GitHub 没有更高的单文件正式版。"
-                    : $"GitHub 检查失败：{SafeError(remoteError)}", "检查升级",
+                    : $"检查失败：{(remoteError is InvalidDataException ? remoteError.Message : SafeError(remoteError))}", "检查升级",
                     MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
             if (System.Windows.MessageBox.Show(this,
-                    $"从 {current} 升级到 {remote.Version}？\n确认后从 GitHub 下载并校验程序，退出旧版后原位替换。历史账号快照不会删除。",
+                    $"从 {current} 升级到 {remote.Version}？\n确认后下载并校验程序；GitHub 连接失败时使用备用线路。退出旧版后原位替换，历史账号快照不会删除。",
                     "升级程序", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
             _upgradeDownloading = true;
             SetUpgradeVisual("下载中", 0);
@@ -1404,6 +1406,12 @@ internal sealed class GlassWidget : Window
             var progress = new Progress<DownloadProgress>(value =>
             {
                 if (!_upgradeBusy || !_upgradeDownloading) return;
+                if (value.Status is not null)
+                {
+                    SetUpgradeVisual("切换中", null);
+                    if (_status is not null) _status.Text = value.Status;
+                    return;
+                }
                 if (value.Verifying)
                 {
                     SetUpgradeVisual("校验中", null);
