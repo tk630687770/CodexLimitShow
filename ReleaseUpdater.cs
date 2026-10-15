@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -35,6 +36,9 @@ internal sealed class ReleaseUpdater
     private readonly SemaphoreSlim _checkGate = new(1, 1);
     private DateTimeOffset? _lastAttemptUtc;
     private string? _etag;
+    private const string FailureKey = "CodexLimitShow.UpdateFailure";
+    private const string PreviousFailureKey = "CodexLimitShow.PreviousUpdateFailure";
+    private sealed record FailureContext(string Route, string Stage, long Received);
 
     private sealed record UpdateCheckCache(DateTimeOffset LastAttemptUtc, string? ETag,
         string? Version, string? DownloadUrl, string? Sha256, string? Signature = null);
@@ -93,7 +97,12 @@ internal sealed class ReleaseUpdater
             catch (Exception ex) when (IsNetworkFailure(ex, cancellationToken))
             {
                 status?.Report("GitHub 直连失败，正在切换备用线路检查版本…");
-                await ReadMetadataAsync(mirror: true, cancellationToken).ConfigureAwait(false);
+                try { await ReadMetadataAsync(mirror: true, cancellationToken).ConfigureAwait(false); }
+                catch (Exception backupError)
+                {
+                    backupError.Data[PreviousFailureKey] = DescribeFailure(ex);
+                    throw;
+                }
             }
             SaveCheckCache();
             return CachedRelease;
@@ -103,40 +112,95 @@ internal sealed class ReleaseUpdater
 
     private async Task ReadMetadataAsync(bool mirror, CancellationToken cancellationToken)
     {
-        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        attempt.CancelAfter(TimeSpan.FromSeconds(8));
-        using var request = new HttpRequestMessage(HttpMethod.Get,
-            (mirror ? MirrorPrefix : "") + $"https://api.github.com/repos/{Repository}/releases/latest");
-        // ETags belong to the direct origin; never let a mirror's 304 bypass signature verification.
-        if (!mirror && EntityTagHeaderValue.TryParse(_etag, out var tag)) request.Headers.IfNoneMatch.Add(tag);
-        using var response = await _github.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attempt.Token)
-            .ConfigureAwait(false);
-        if (!mirror && response.StatusCode == HttpStatusCode.NotModified) { MetadataViaMirror = false; return; }
-        if (response.StatusCode == HttpStatusCode.NotFound)
+        var stage = "连接版本接口";
+        try
         {
-            CachedRelease = null;
-            _etag = null;
-        }
-        else
-        {
-            response.EnsureSuccessStatusCode();
-            if (response.Content.Headers.ContentLength > MaximumMetadataBytes)
-                throw new InvalidDataException("GitHub 版本信息超出大小限制。");
-            await using var stream = await response.Content.ReadAsStreamAsync(attempt.Token).ConfigureAwait(false);
-            using var payload = new MemoryStream();
-            var buffer = new byte[16_384];
-            int read;
-            while ((read = await stream.ReadAsync(buffer, attempt.Token).ConfigureAwait(false)) > 0)
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            attempt.CancelAfter(TimeSpan.FromSeconds(8));
+            using var request = new HttpRequestMessage(HttpMethod.Get,
+                (mirror ? MirrorPrefix : "") + $"https://api.github.com/repos/{Repository}/releases/latest");
+            // ETags belong to the direct origin; never let a mirror's 304 bypass signature verification.
+            if (!mirror && EntityTagHeaderValue.TryParse(_etag, out var tag)) request.Headers.IfNoneMatch.Add(tag);
+            using var response = await _github.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attempt.Token)
+                .ConfigureAwait(false);
+            if (!mirror && response.StatusCode == HttpStatusCode.NotModified) { MetadataViaMirror = false; return; }
+            if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                if (payload.Length + read > MaximumMetadataBytes)
-                    throw new InvalidDataException("GitHub 版本信息超出大小限制。");
-                payload.Write(buffer, 0, read);
+                CachedRelease = null;
+                _etag = null;
             }
-            using var document = JsonDocument.Parse(payload.GetBuffer().AsMemory(0, (int)payload.Length));
-            CachedRelease = ParseRemoteRelease(document.RootElement, mirror, _verificationKey);
-            _etag = mirror ? null : response.Headers.ETag?.ToString();
+            else
+            {
+                response.EnsureSuccessStatusCode();
+                stage = "读取版本信息";
+                if (response.Content.Headers.ContentLength > MaximumMetadataBytes)
+                    throw new InvalidDataException("GitHub 版本信息超出大小限制。");
+                await using var stream = await response.Content.ReadAsStreamAsync(attempt.Token).ConfigureAwait(false);
+                using var payload = new MemoryStream();
+                var buffer = new byte[16_384];
+                int read;
+                while ((read = await stream.ReadAsync(buffer, attempt.Token).ConfigureAwait(false)) > 0)
+                {
+                    if (payload.Length + read > MaximumMetadataBytes)
+                        throw new InvalidDataException("GitHub 版本信息超出大小限制。");
+                    payload.Write(buffer, 0, read);
+                }
+                stage = "解析版本信息";
+                using var document = JsonDocument.Parse(payload.GetBuffer().AsMemory(0, (int)payload.Length));
+                stage = "验证发布信息及签名";
+                CachedRelease = ParseRemoteRelease(document.RootElement, mirror, _verificationKey);
+                _etag = mirror ? null : response.Headers.ETag?.ToString();
+            }
+            MetadataViaMirror = mirror;
         }
-        MetadataViaMirror = mirror;
+        catch (Exception ex)
+        {
+            RecordFailure(ex, mirror, stage);
+            throw;
+        }
+    }
+
+    // Keep the original exception type so network fallback and security-stop rules do not change.
+    private static void RecordFailure(Exception error, bool mirror, string stage, long received = 0) =>
+        error.Data[FailureKey] = new FailureContext(mirror ? "备用线路（gh-proxy.org）" : "GitHub 直连", stage, received);
+
+    internal static string DescribeFailure(Exception error, string fallbackStage = "准备升级")
+    {
+        var context = error.Data[FailureKey] as FailureContext ?? new FailureContext("本机", fallbackStage, 0);
+        var networkError = error switch
+        {
+            HttpRequestException http => http.HttpRequestError,
+            HttpIOException http => http.HttpRequestError,
+            _ => HttpRequestError.Unknown
+        };
+        var tlsFailure = networkError == HttpRequestError.SecureConnectionError;
+        for (Exception? cause = error; cause is not null; cause = cause.InnerException)
+            tlsFailure |= cause is AuthenticationException;
+        var reason = tlsFailure ? "HTTPS 安全连接（SSL/TLS）建立失败。请检查代理出口或稍后手动重试，不要关闭证书校验。" : error switch
+        {
+            OperationCanceledException or TimeoutException => "等待超时或操作被取消，可稍后手动重试。",
+            HttpRequestException { StatusCode: { } code } => $"服务器返回 HTTP {(int)code}，请检查当前入口或稍后重试。",
+            _ when networkError == HttpRequestError.NameResolutionError => "无法解析服务器域名，请检查 DNS 和代理状态。",
+            _ when networkError == HttpRequestError.ResponseEnded => "传输连接提前结束，响应尚未接收完整。可稍后手动重试。",
+            HttpRequestException or HttpIOException => "网络连接失败或传输中断，请检查实际代理出口或稍后手动重试。",
+            InvalidDataException when context.Stage == "验证发布信息及签名" => "发布信息或签名验证失败，已停止升级，不会绕过校验。",
+            InvalidDataException when context.Stage == "校验下载文件" => "下载文件的哈希或产品版本不匹配，已拒绝安装。",
+            InvalidDataException => "发布信息或文件安全校验未通过，已停止升级。",
+            JsonException or KeyNotFoundException or FormatException => "服务器返回的版本信息格式异常，无法继续升级。",
+            InvalidOperationException when context.Stage is "解析版本信息" or "验证发布信息及签名" => "版本信息结构异常，无法继续安全校验。",
+            InvalidOperationException => "升级所需的参数、版本或文件状态不满足要求，请重新启动组件或检查正式版程序文件。",
+            ArgumentException => "升级参数或路径无效，请检查正式版程序文件。",
+            UnauthorizedAccessException => "文件访问被拒绝，请检查目录写入权限或安全软件拦截。",
+            IOException => "本地文件读写失败，请检查磁盘空间、目录权限或文件占用。",
+            System.ComponentModel.Win32Exception => "无法启动升级程序，请检查程序文件是否可用或被安全软件拦截。",
+            _ => "升级操作未完成，请保留以下诊断信息以便排查。"
+        };
+        var diagnosis = error.GetType().Name + (networkError == HttpRequestError.Unknown ? "" : $" / {networkError}");
+        var text = $"线路：{context.Route}\n阶段：{context.Stage}\n{reason}";
+        if (context.Received > 0) text += $"\n本次线路已接收 {context.Received / 1_048_576d:0.0} MB。";
+        text += $"\n诊断：{diagnosis}";
+        if (error.Data[PreviousFailureKey] is string previous) text += $"\n\n此前尝试失败：\n{previous}";
+        return text;
     }
 
     private static bool IsNetworkFailure(Exception error, CancellationToken token) => !token.IsCancellationRequested &&
@@ -258,7 +322,12 @@ internal sealed class ReleaseUpdater
             {
                 if (File.Exists(destination)) File.Delete(destination);
                 progress?.Report(new DownloadProgress(0, null, false, "GitHub 下载失败，正在切换备用线路重新下载…", Mirror: true));
-                await DownloadRouteAsync(remote, destination, true, progress, budget.Token).ConfigureAwait(false);
+                try { await DownloadRouteAsync(remote, destination, true, progress, budget.Token).ConfigureAwait(false); }
+                catch (Exception backupError)
+                {
+                    backupError.Data[PreviousFailureKey] = DescribeFailure(ex);
+                    throw;
+                }
             }
             return destination;
         }
@@ -272,46 +341,63 @@ internal sealed class ReleaseUpdater
     private async Task DownloadRouteAsync(RemoteReleaseCandidate remote, string destination, bool mirror,
         IProgress<DownloadProgress>? progress, CancellationToken cancellationToken)
     {
-        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        attempt.CancelAfter(TimeSpan.FromSeconds(8));
-        using var response = await _github.GetAsync((mirror ? MirrorPrefix : "") + remote.DownloadUrl,
-            HttpCompletionOption.ResponseHeadersRead, attempt.Token)
-            .ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
-        var expectedBytes = response.Content.Headers.ContentLength;
-        if (expectedBytes > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
-        if (expectedBytes is <= 0) expectedBytes = null;
-        progress?.Report(new DownloadProgress(0, expectedBytes, false, Mirror: mirror));
+        var stage = "连接下载服务器";
         long total = 0;
-        await using (var source = await response.Content.ReadAsStreamAsync(attempt.Token).ConfigureAwait(false))
-        await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        try
         {
-            var buffer = new byte[81920];
-            long lastReportedBytes = 0;
-            var lastPercent = 0;
-            int read;
-            while (true)
+            using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            attempt.CancelAfter(TimeSpan.FromSeconds(8));
+            using var response = await _github.GetAsync((mirror ? MirrorPrefix : "") + remote.DownloadUrl,
+                HttpCompletionOption.ResponseHeadersRead, attempt.Token)
+                .ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            stage = "检查下载响应";
+            var expectedBytes = response.Content.Headers.ContentLength;
+            if (expectedBytes > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
+            if (expectedBytes is <= 0) expectedBytes = null;
+            progress?.Report(new DownloadProgress(0, expectedBytes, false, Mirror: mirror));
+            stage = "创建下载临时文件";
+            await using (var source = await response.Content.ReadAsStreamAsync(attempt.Token).ConfigureAwait(false))
+            await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
-                attempt.CancelAfter(TimeSpan.FromSeconds(30));
-                read = await source.ReadAsync(buffer, attempt.Token).ConfigureAwait(false);
-                if (read == 0) break;
-                total += read;
-                if (total > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
-                await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-                var current = new DownloadProgress(total, expectedBytes, false, Mirror: mirror);
-                if ((current.Percent is { } percent && percent > lastPercent) ||
-                    (expectedBytes is null && total - lastReportedBytes >= 1_048_576))
+                var buffer = new byte[81920];
+                long lastReportedBytes = 0;
+                var lastPercent = 0;
+                int read;
+                while (true)
                 {
-                    progress?.Report(current);
-                    lastPercent = current.Percent ?? lastPercent;
-                    lastReportedBytes = total;
+                    stage = "下载文件";
+                    attempt.CancelAfter(TimeSpan.FromSeconds(30));
+                    read = await source.ReadAsync(buffer, attempt.Token).ConfigureAwait(false);
+                    if (read == 0) break;
+                    total += read;
+                    if (total > MaximumBytes) throw new InvalidDataException("发布程序超出大小限制。");
+                    stage = "写入下载文件";
+                    await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                    var current = new DownloadProgress(total, expectedBytes, false, Mirror: mirror);
+                    if ((current.Percent is { } percent && percent > lastPercent) ||
+                        (expectedBytes is null && total - lastReportedBytes >= 1_048_576))
+                    {
+                        progress?.Report(current);
+                        lastPercent = current.Percent ?? lastPercent;
+                        lastReportedBytes = total;
+                    }
                 }
+                stage = "保存下载文件";
             }
+            progress?.Report(new DownloadProgress(total, expectedBytes, true, Mirror: mirror));
+            stage = "下载文件";
+            if (expectedBytes is not null && total != expectedBytes)
+                throw new HttpRequestException(HttpRequestError.ResponseEnded, "下载未完成。");
+            stage = "校验下载文件";
+            if (!HashMatches(destination, remote.Sha256) || _readVersion(destination) != remote.Version)
+                throw new InvalidDataException("GitHub 发布程序校验失败。");
         }
-        progress?.Report(new DownloadProgress(total, expectedBytes, true, Mirror: mirror));
-        if (expectedBytes is not null && total != expectedBytes) throw new HttpRequestException("下载未完成。");
-        if (!HashMatches(destination, remote.Sha256) || _readVersion(destination) != remote.Version)
-            throw new InvalidDataException("GitHub 发布程序校验失败。");
+        catch (Exception ex)
+        {
+            RecordFailure(ex, mirror, stage, total);
+            throw;
+        }
     }
 
     public void Apply(string sourceExecutable, string targetExecutable, int oldProcessId, string expectedSha256)
@@ -471,6 +557,7 @@ internal sealed class ReleaseUpdater
             Directory.CreateDirectory(root);
             SelfTestMetadata(root, releaseJson);
             SelfTestFallback(root, releaseJson);
+            SelfTestFailureText(root, releaseJson);
             var source = Path.Combine(UpdateDirectory(), $"CodexLimitShow-update-{Guid.NewGuid():N}.exe");
             var target = Path.Combine(root, ExecutableName);
             Directory.CreateDirectory(UpdateDirectory());
@@ -740,6 +827,102 @@ internal sealed class ReleaseUpdater
         File.WriteAllText(cachePath, JsonSerializer.Serialize(cache with { Signature = Convert.ToBase64String(new byte[64]) }));
         if (new ReleaseUpdater(github: client, cachePath: cachePath, verificationKey: key).CachedRelease is not null)
             throw new Exception("Tampered signed update cache was accepted.");
+    }
+
+    private static void SelfTestFailureText(string root, string releaseJson)
+    {
+        const string privateDetail = "https://private-user:private-password@proxy.invalid/?token=private-token";
+        var tls = new HttpRequestException(HttpRequestError.SecureConnectionError, privateDetail,
+            new AuthenticationException(privateDetail));
+        var metadataCalls = 0;
+        using (var offline = new HttpClient(new MetadataTestHandler(request =>
+        {
+            metadataCalls++;
+            if (request.RequestUri!.Host == "api.github.com") throw new TaskCanceledException(privateDetail);
+            throw tls;
+        })))
+        {
+            var service = new ReleaseUpdater(github: offline, cachePath: Path.Combine(root, "failure-context.json"));
+            var checkedError = false;
+            try { service.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+            catch (HttpRequestException error)
+            {
+                var text = DescribeFailure(error);
+                checkedError = ReferenceEquals(error, tls) && metadataCalls == 2 &&
+                    text.Contains("备用线路（gh-proxy.org）") && text.Contains("连接版本接口") &&
+                    text.Contains("SSL/TLS") && text.Contains("此前尝试失败") && text.Contains("GitHub 直连") &&
+                    text.Contains("超时") && text.Contains("SecureConnectionError") && !text.Contains("private-");
+            }
+            if (!checkedError) throw new Exception("Metadata failure must preserve both routes, the original exception type and safe Chinese diagnostics.");
+        }
+
+        foreach (var badJson in new[] { "<html>" + privateDetail + "</html>",
+            releaseJson.TrimEnd()[..^1] + ",\"body\":\"<!-- CodexLimitShow-Signature:v1:invalid -->\"}" })
+        {
+            var calls = 0;
+            using var corrupt = new HttpClient(new MetadataTestHandler(_ =>
+            {
+                calls++;
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(badJson) };
+            }));
+            var service = new ReleaseUpdater(github: corrupt, cachePath: Path.Combine(root, $"bad-metadata-{Guid.NewGuid():N}.json"));
+            var rejected = false;
+            try { service.CheckRemoteAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+            catch (Exception error) when (error is JsonException or InvalidDataException)
+            {
+                var text = DescribeFailure(error);
+                rejected = calls == 1 && text.Contains(error is JsonException ? "解析版本信息" : "验证发布信息及签名") &&
+                    !text.Contains("private-") && !IsNetworkFailure(error, CancellationToken.None);
+            }
+            if (!rejected) throw new Exception("Metadata parsing and signature failures must retain their stage without unsafe retries or response disclosure.");
+        }
+
+        var remote = new RemoteReleaseCandidate(new Version(2, 0, 0),
+            $"https://github.com/{Repository}/releases/download/v2.0.0/{ExecutableName}", new string('a', 64));
+        var downloadCalls = 0;
+        using (var broken = new HttpClient(new MetadataTestHandler(request =>
+        {
+            downloadCalls++;
+            if (request.RequestUri!.Host != "github.com")
+                throw new HttpRequestException(HttpRequestError.SecureConnectionError, privateDetail);
+            var content = new ByteArrayContent(new byte[1_048_576]);
+            content.Headers.ContentLength = 2_621_440;
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        })))
+        {
+            var service = new ReleaseUpdater(github: broken, cachePath: Path.Combine(root, "broken-transfer.json"));
+            var before = Directory.GetFiles(UpdateDirectory()).Order().ToArray();
+            var rejected = false;
+            try { service.DownloadAsync(remote, null, CancellationToken.None).GetAwaiter().GetResult(); }
+            catch (HttpRequestException error)
+            {
+                var text = DescribeFailure(error);
+                rejected = downloadCalls == 2 && text.Contains("连接下载服务器") && text.Contains("SSL/TLS") &&
+                    text.Contains("此前尝试失败") && text.Contains("下载文件") && text.Contains("ResponseEnded") &&
+                    text.Contains($"{1d:0.0} MB") && !text.Contains("private-");
+            }
+            if (!rejected || !Directory.GetFiles(UpdateDirectory()).Order().SequenceEqual(before))
+                throw new Exception("A 40-percent partial transfer followed by backup TLS failure must retain both stages and clean the partial download.");
+        }
+        foreach (var (error, expected) in new (Exception Error, string Expected)[]
+        {
+            (new HttpRequestException(privateDetail, null, HttpStatusCode.Forbidden), "HTTP 403"),
+            (new HttpRequestException(HttpRequestError.NameResolutionError, privateDetail), "DNS"),
+            (new OperationCanceledException(privateDetail), "超时"), (new IOException(privateDetail), "磁盘空间"),
+            (new UnauthorizedAccessException(privateDetail), "权限"), (new Exception(privateDetail), "诊断"),
+            (new System.ComponentModel.Win32Exception(5, privateDetail), "无法启动"),
+            (new HttpRequestException(privateDetail, new AuthenticationException(privateDetail)), "SSL/TLS"),
+            (new ArgumentException(privateDetail), "参数或路径")
+        })
+        {
+            var text = DescribeFailure(error, "启动升级辅助程序");
+            if (!text.Contains("本机") || !text.Contains("启动升级辅助程序") || !text.Contains(expected) || text.Contains("private-"))
+                throw new Exception("Local update diagnostics must show the caller stage without raw credentials, URLs or messages.");
+        }
+        var invalidFile = new InvalidDataException(privateDetail);
+        RecordFailure(invalidFile, true, "校验下载文件");
+        if (!DescribeFailure(invalidFile).Contains("哈希或产品版本") || IsNetworkFailure(invalidFile, CancellationToken.None))
+            throw new Exception("Invalid update files must retain their security-check context and never trigger a retry.");
     }
 
     private sealed class TestProgress<T>(Action<T> report) : IProgress<T>

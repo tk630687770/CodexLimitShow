@@ -16,14 +16,14 @@ internal static class WpfMain
             try { ReleaseUpdater.VerifyMirrorAsync(output).GetAwaiter().GetResult(); }
             catch (Exception ex)
             {
-                output.WriteLine($"mirror probe failed: {ex.GetType().Name}" +
-                    (ex is InvalidDataException ? $"; {ex.Message}" : ""));
+                output.WriteLine("备用升级诊断失败\n" + ReleaseUpdater.DescribeFailure(ex, "备用线路诊断"));
                 Environment.ExitCode = 1;
             }
             return;
         }
         if (args.Length > 0 && args[0] == "--apply-update")
         {
+            var stage = "校验并替换程序";
             try
             {
                 if (args.Length != 5 || !int.TryParse(args[3], out var oldProcessId) ||
@@ -31,12 +31,13 @@ internal static class WpfMain
                         Path.GetFullPath(args[1]), StringComparison.OrdinalIgnoreCase))
                     throw new ArgumentException("升级参数无效。");
                 new ReleaseUpdater().Apply(args[1], args[2], oldProcessId, args[4]);
+                stage = "启动新版程序";
                 Process.Start(new ProcessStartInfo(args[2])
                     { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(args[2]))! });
             }
             catch (Exception ex)
             {
-                System.Windows.MessageBox.Show($"升级失败；如果程序已替换，可从 GitHub 历史 Release 取回旧版。\n{ex.Message}",
+                System.Windows.MessageBox.Show($"升级未完成\n\n{ReleaseUpdater.DescribeFailure(ex, stage)}\n\n如果程序已替换，可从 GitHub 历史 Release 取回旧版。",
                     "CodexLimitShow", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             return;

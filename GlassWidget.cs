@@ -1372,11 +1372,13 @@ internal sealed class GlassWidget : Window
     {
         if (_upgradeBusy) return;
         _upgradeBusy = true;
+        var stage = "准备升级";
         try
         {
             var current = _releaseUpdater.CurrentVersion(Environment.ProcessPath) ??
                 throw new InvalidOperationException("无法读取当前程序版本。");
             if (_status is not null) _status.Text = "正在检查 GitHub 正式版…";
+            stage = "检查版本";
             RemoteReleaseCandidate? remote = null;
             Exception? remoteError = null;
             try
@@ -1393,14 +1395,15 @@ internal sealed class GlassWidget : Window
             {
                 System.Windows.MessageBox.Show(this, remoteError is null
                     ? $"当前版本 {current}，GitHub 没有更高的单文件正式版。"
-                    : $"检查失败：{(remoteError is InvalidDataException ? remoteError.Message : SafeError(remoteError))}", "检查升级",
-                    MessageBoxButton.OK, MessageBoxImage.Information);
+                    : $"检查升级失败\n\n{ReleaseUpdater.DescribeFailure(remoteError, stage)}\n\n此次检查未改变当前程序。", "检查升级",
+                    MessageBoxButton.OK, remoteError is null ? MessageBoxImage.Information : MessageBoxImage.Warning);
                 return;
             }
             if (System.Windows.MessageBox.Show(this,
                     $"从 {current} 升级到 {remote.Version}？\n确认后下载并校验程序；GitHub 连接失败时使用备用线路。退出旧版后原位替换，历史账号快照不会删除。",
                     "升级程序", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
             _upgradeDownloading = true;
+            stage = "下载文件";
             SetUpgradeVisual("下载中", 0);
             if (_status is not null) _status.Text = new DownloadProgress(0, null, false, Mirror: _releaseUpdater.MetadataViaMirror).Description;
             var progress = new Progress<DownloadProgress>(value =>
@@ -1424,6 +1427,7 @@ internal sealed class GlassWidget : Window
             });
             var downloaded = await _releaseUpdater.DownloadAsync(remote, progress, CancellationToken.None);
             _upgradeDownloading = false;
+            stage = "启动升级辅助程序";
             SetUpgradeVisual("安装中", null);
             if (_status is not null) _status.Text = "正在安装新版…";
             var start = new ProcessStartInfo(downloaded) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(downloaded)! };
@@ -1437,7 +1441,7 @@ internal sealed class GlassWidget : Window
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(this, $"升级未开始：{ex.Message}", "升级正式版",
+            System.Windows.MessageBox.Show(this, $"升级未完成\n\n{ReleaseUpdater.DescribeFailure(ex, stage)}\n\n尚未替换当前程序，可继续使用原版本。", "升级失败",
                 MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
